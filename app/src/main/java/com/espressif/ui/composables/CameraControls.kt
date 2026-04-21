@@ -418,8 +418,9 @@ fun WebRtcVideoPlayer(
                     }
                 }
 
-                // Camera and Mic toggle buttons at the bottom
-                if (WebRtcConstants.ENABLE_MEDIA_TOGGLE_UI) {
+                // Outbound mic/camera (talk-back) toggles — gated on manager
+                // readiness so they don't render dead before a session exists.
+                if (webRtcManager != null && WebRtcConstants.ENABLE_MEDIA_TOGGLE_UI) {
                     Row(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)

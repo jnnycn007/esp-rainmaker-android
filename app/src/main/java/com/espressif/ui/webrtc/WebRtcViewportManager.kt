@@ -35,9 +35,9 @@ import org.webrtc.VideoEncoderFactory
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import org.webrtc.audio.JavaAudioDeviceModule
+import org.webrtc.BaselineDefaultVideoEncoderFactory
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.LowLatencyDefaultVideoDecoderFactory
-import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.RTCStats
 import java.net.URI
 import java.util.*
@@ -150,7 +150,7 @@ class WebRtcViewportManager(
 
     companion object {
         private const val ENABLE_INTEL_VP8_ENCODER = true
-        private const val ENABLE_H264_HIGH_PROFILE = true
+        private const val ENABLE_H264_HIGH_PROFILE = false
 
         @Volatile
         private var peerConnectionFactoryInitialized = false
@@ -159,9 +159,9 @@ class WebRtcViewportManager(
         private const val LOCAL_MEDIA_STREAM_LABEL = "KvsLocalMediaStream"
         private const val VIDEO_TRACK_ID = "KvsVideoTrack"
         private const val AUDIO_TRACK_ID = "KvsAudioTrack"
-        private const val VIDEO_WIDTH = 640
-        private const val VIDEO_HEIGHT = 480
-        private const val VIDEO_FPS = 20
+        private const val VIDEO_WIDTH = 320
+        private const val VIDEO_HEIGHT = 240
+        private const val VIDEO_FPS = 8
 
         private const val MAX_OFFER_RETRIES = 3
         private const val OFFER_TIMEOUT_MS = 5000L
@@ -612,7 +612,7 @@ class WebRtcViewportManager(
             ensureFactoryInitialized(context)
 
             val vdf = LowLatencyDefaultVideoDecoderFactory(rootEglBase!!.eglBaseContext)
-            val vef = DefaultVideoEncoderFactory(
+            val vef = BaselineDefaultVideoEncoderFactory(
                 rootEglBase!!.eglBaseContext,
                 ENABLE_INTEL_VP8_ENCODER,
                 ENABLE_H264_HIGH_PROFILE

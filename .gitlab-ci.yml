@@ -3,9 +3,9 @@ stages:
 
 build_apk:
     stage: build
-    image: espressif/idf:latest
+    image: gitlab.espressif.cn:5050/esp_rainmaker/cloud_backend/cloudbackend:22May26py313
     tags:
-        - build
+        - rmng
 
     variables:
       deployment: "production"  
@@ -17,10 +17,7 @@ build_apk:
           when: always
 
     script:
-        - rm -rf /tmp/esp-rainmaker-jenkins-ci
-        - git clone https://$CI_GITLAB_USERNAME_APP_FRAMEWORKS:$CI_GITLAB_PASSWORD_APP_FRAMEWORKS@gitlab.espressif.cn:6688/app-frameworks/esp-rainmaker-jenkins-ci.git
-        - cd esp-rainmaker-jenkins-ci
+        - git clone --single-branch --depth 1 https://$CI_GITLAB_USERNAME_APP_FRAMEWORKS:$CI_GITLAB_PASSWORD_APP_FRAMEWORKS@gitlab.espressif.cn:6688/app-frameworks/eagle.git
+        - cd eagle/tools/gitci
         - pip3 install -r requirements.txt
-        - python3 key_update.py android-rm-app.params --key branch --value $CI_COMMIT_REF_NAME
-        - python3 key_update.py android-rm-app.params --key deployment --value $deployment
-        - python3 -u git_jenkins_ci_gateway_cli.py android-rm-app --gateway_branch test/android-rm-app/$CI_COMMIT_REF_NAME
+        - python3 -u esp_rm_android_app.py --branch ${CI_COMMIT_REF_NAME} --deployment ${deployment}

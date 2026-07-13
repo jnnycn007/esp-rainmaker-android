@@ -49,8 +49,8 @@ import org.webrtc.AudioTrack;
 import org.webrtc.Camera1Enumerator;
 import org.webrtc.CameraEnumerator;
 import org.webrtc.DataChannel;
+import org.webrtc.BaselineDefaultVideoEncoderFactory;
 import org.webrtc.DefaultVideoDecoderFactory;
-import org.webrtc.DefaultVideoEncoderFactory;
 import org.webrtc.EglBase;
 import org.webrtc.IceCandidate;
 import org.webrtc.Logging;
@@ -91,12 +91,12 @@ public class WebRtcActivity extends AppCompatActivity {
     private static final String AudioTrackID = "KvsAudioTrack";
     private static final String VideoTrackID = "KvsVideoTrack";
     private static final String LOCAL_MEDIA_STREAM_LABEL = "KvsLocalMediaStream";
-    private static final int VIDEO_SIZE_WIDTH = 400;
-    private static final int VIDEO_SIZE_HEIGHT = 300;
-    private static final int VIDEO_FPS = 30;
+    private static final int VIDEO_SIZE_WIDTH = 240;
+    private static final int VIDEO_SIZE_HEIGHT = 240;
+    private static final int VIDEO_FPS = 15;
     private static final String CHANNEL_ID = "WebRtcDataChannel";
     private static final boolean ENABLE_INTEL_VP8_ENCODER = true;
-    private static final boolean ENABLE_H264_HIGH_PROFILE = true;
+    private static final boolean ENABLE_H264_HIGH_PROFILE = false;
 
     // Feature toggles
     private static final boolean ENABLE_DATA_CHANNEL = false;
@@ -829,7 +829,7 @@ public class WebRtcActivity extends AppCompatActivity {
         for (final VideoCodecInfo videoCodecInfo : vdf.getSupportedCodecs()) {
             Log.d(TAG, videoCodecInfo.name);
         }
-        final VideoEncoderFactory vef = new DefaultVideoEncoderFactory(rootEglBase.getEglBaseContext(),
+        final VideoEncoderFactory vef = new BaselineDefaultVideoEncoderFactory(rootEglBase.getEglBaseContext(),
                 ENABLE_INTEL_VP8_ENCODER, ENABLE_H264_HIGH_PROFILE);
         Log.d(TAG, "Available encoders on this device:");
         for (final VideoCodecInfo videoCodecInfo : vef.getSupportedCodecs()) {

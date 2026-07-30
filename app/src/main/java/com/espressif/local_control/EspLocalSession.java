@@ -19,6 +19,8 @@ import com.espressif.provisioning.listeners.ResponseListener;
 import com.espressif.provisioning.security.Security;
 import com.espressif.provisioning.transport.Transport;
 
+import java.util.concurrent.Semaphore;
+
 /**
  * Session object encapsulates the Transport and Security
  * protocol implementations and is responsible for performing
@@ -30,6 +32,12 @@ public class EspLocalSession {
     private Transport transport;
     private Security security;
     private boolean isSessionEstablished;
+    // Serializes the full encrypt → send → receive → decrypt cycle.
+    // Security1/2 AES-CTR uses a shared nonce for both directions, so
+    // decrypt(response_A) must complete before encrypt(request_B) starts.
+    // A Semaphore (vs synchronized) allows acquire on the calling thread
+    // and release on the transport callback thread.
+    private final Semaphore requestLock = new Semaphore(1);
 
     /**
      * Initialize Session object with Transport and Security interface implementations
@@ -118,18 +126,67 @@ public class EspLocalSession {
         }
     }
 
+    /**
+     * Acquire the request lock externally.  Use this to hold the lock across
+     * multiple {@link #sendDataToDevice} calls (e.g. fragmented sends) so that
+     * other callers cannot interleave between them.
+     * <p>
+     * When held externally, {@code sendDataToDevice} calls made <b>on the same
+     * thread</b> skip their own acquire/release. Calls from any other thread still
+     * acquire (and therefore block) so concurrent crypto cannot interleave.
+     * The caller MUST call {@link #releaseRequestLock()} when done.
+     */
+    public void acquireRequestLock() throws InterruptedException {
+        requestLock.acquire();
+        requestLockOwner = Thread.currentThread();
+    }
+
+    public void releaseRequestLock() {
+        requestLockOwner = null;
+        requestLock.release();
+    }
+
+    // Thread that currently holds requestLock via acquireRequestLock(), or null.
+    // Must be thread-scoped (not a plain boolean): a process-wide "held" flag let
+    // any concurrent caller skip the lock and race encrypt/decrypt, corrupting the
+    // Security1/2 AES-CTR keystream shared across request/response.
+    private volatile Thread requestLockOwner = null;
+
     public void sendDataToDevice(final String path, byte[] data, final ResponseListener listener) {
 
-        final byte[] encryptedData = security.encrypt(data);
-
         if (isSessionEstablished) {
+
+            // Only the thread that holds the lock externally (e.g. a fragmented send in
+            // progress) may skip the acquire; every other caller MUST acquire so concurrent
+            // encrypt/decrypt cannot interleave and corrupt the AES-CTR keystream.
+            final boolean ownLock = (Thread.currentThread() != requestLockOwner);
+            if (ownLock) {
+                // Acquire the request lock to serialize the full
+                // encrypt → HTTP POST → decrypt cycle across concurrent callers.
+                try {
+                    requestLock.acquire();
+                } catch (InterruptedException e) {
+                    if (listener != null) {
+                        listener.onFailure(e);
+                    }
+                    return;
+                }
+            }
+
+            final byte[] encryptedData = security.encrypt(data);
 
             transport.sendConfigData(path, encryptedData, new ResponseListener() {
 
                 @Override
                 public void onSuccess(byte[] returnData) {
-
-                    byte[] decryptedData = security.decrypt(returnData);
+                    byte[] decryptedData;
+                    try {
+                        decryptedData = security.decrypt(returnData);
+                    } finally {
+                        if (ownLock) {
+                            requestLock.release();
+                        }
+                    }
                     if (listener != null) {
                         listener.onSuccess(decryptedData);
                     }
@@ -137,6 +194,9 @@ public class EspLocalSession {
 
                 @Override
                 public void onFailure(Exception e) {
+                    if (ownLock) {
+                        requestLock.release();
+                    }
                     isSessionEstablished = false;
                     if (listener != null) {
                         listener.onFailure(e);
@@ -150,24 +210,8 @@ public class EspLocalSession {
 
                 @Override
                 public void OnSessionEstablished() {
-
-                    transport.sendConfigData(path, encryptedData, new ResponseListener() {
-
-                        @Override
-                        public void onSuccess(byte[] returnData) {
-                            if (listener != null) {
-                                listener.onSuccess(returnData);
-                            }
-                        }
-
-                        @Override
-                        public void onFailure(Exception e) {
-                            isSessionEstablished = false;
-                            if (listener != null) {
-                                listener.onFailure(e);
-                            }
-                        }
-                    });
+                    // Retry now that session is established
+                    sendDataToDevice(path, data, listener);
                 }
 
                 @Override

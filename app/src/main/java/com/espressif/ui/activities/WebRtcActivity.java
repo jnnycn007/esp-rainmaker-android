@@ -33,7 +33,12 @@ import com.amazonaws.auth.AWSSessionCredentials;
 import com.amazonaws.regions.Region;
 import com.amazonaws.services.kinesisvideowebrtcstorage.AWSKinesisVideoWebRTCStorageClient;
 import com.amazonaws.services.kinesisvideowebrtcstorage.model.JoinStorageSessionRequest;
+import com.espressif.EspApplication;
+import com.espressif.local_control.EspLocalDevice;
 import com.espressif.rainmaker.R;
+import com.espressif.ui.composables.CameraControlsKt;
+import com.espressif.ui.webrtc.LocalSignalingClient;
+import com.espressif.ui.webrtc.WebRtcViewportManager;
 import com.espressif.webrtc.AwsV4Signer;
 import com.espressif.webrtc.Constants;
 import com.espressif.webrtc.Event;
@@ -91,6 +96,9 @@ public class WebRtcActivity extends AppCompatActivity {
     private static final String AudioTrackID = "KvsAudioTrack";
     private static final String VideoTrackID = "KvsVideoTrack";
     private static final String LOCAL_MEDIA_STREAM_LABEL = "KvsLocalMediaStream";
+    // Channel name format is "esp-v1-<nodeId>"; local-signaling peer IDs are "local-app-<id>".
+    private static final String CHANNEL_NAME_PREFIX = "esp-v1-";
+    private static final String LOCAL_PEER_ID_PREFIX = "local-app-";
     private static final int VIDEO_SIZE_WIDTH = 240;
     private static final int VIDEO_SIZE_HEIGHT = 240;
     private static final int VIDEO_FPS = 15;
@@ -102,6 +110,7 @@ public class WebRtcActivity extends AppCompatActivity {
     private static final boolean ENABLE_DATA_CHANNEL = false;
 
     private static volatile SignalingServiceWebSocketClient client;
+    private LocalSignalingClient localClient;
     private PeerConnectionFactory peerConnectionFactory;
 
     private VideoSource videoSource;
@@ -123,7 +132,7 @@ public class WebRtcActivity extends AppCompatActivity {
 
     private EglBase rootEglBase = null;
     // Store viewport manager reference when reusing session to check if PeerConnection is still valid
-    private com.espressif.ui.webrtc.WebRtcViewportManager viewportManagerForReusedSession = null;
+    private WebRtcViewportManager viewportManagerForReusedSession = null;
     private VideoCapturer videoCapturer;
 
     private final List<IceServer> peerIceServers = new ArrayList<>();
@@ -441,6 +450,12 @@ public class WebRtcActivity extends AppCompatActivity {
         // This must happen before any other cleanup
         stopStatsCollection();
 
+        // Clean up local signaling client
+        if (localClient != null) {
+            localClient.disconnect();
+            localClient = null;
+        }
+
         // Clear viewport manager reference
         viewportManagerForReusedSession = null;
 
@@ -448,7 +463,7 @@ public class WebRtcActivity extends AppCompatActivity {
         // Avoid blocking the main thread so the viewport renderer can display
         // frames as soon as its surface is ready.
         if (reuseSession) {
-            com.espressif.ui.webrtc.WebRtcViewportManager viewportManager = com.espressif.EspApplication.getViewportWebRtcManager();
+            WebRtcViewportManager viewportManager = EspApplication.getViewportWebRtcManager();
             if (viewportManager != null) {
                 Log.d(TAG, "Transferring video back to viewport before destroying landscape");
                 try {
@@ -494,7 +509,7 @@ public class WebRtcActivity extends AppCompatActivity {
             // Note: We don't store remoteView as it will be destroyed
             // Viewport will add the sink to its own renderer
             // Store PeerConnection so it can be cleaned up if viewport doesn't pick it up
-            com.espressif.EspApplication.setLandscapeSession(remoteVideoTrack, rootEglBase, null, localPeer);
+            EspApplication.setLandscapeSession(remoteVideoTrack, rootEglBase, null, localPeer);
             // Don't release resources yet - viewport will pick them up and handle cleanup
             // But note: localPeer reference is kept in EspApplication for cleanup
         }
@@ -522,7 +537,7 @@ public class WebRtcActivity extends AppCompatActivity {
 
         if (!reuseSession) {
             // Only cleanup WebRTC resources if we created a new session AND not storing for transfer
-            boolean storingForTransfer = com.espressif.EspApplication.landscapeVideoTrack != null;
+            boolean storingForTransfer = EspApplication.landscapeVideoTrack != null;
 
             // Always disconnect client to clean up WebSocket signaling connection
             if (client != null) {
@@ -605,7 +620,7 @@ public class WebRtcActivity extends AppCompatActivity {
         if (reuseSession) {
             // Reuse existing session - transfer video from viewport
             Log.d(TAG, "Reusing session - transferring video from viewport to landscape");
-            com.espressif.ui.webrtc.WebRtcViewportManager viewportManager = com.espressif.EspApplication.getViewportWebRtcManager();
+            WebRtcViewportManager viewportManager = EspApplication.getViewportWebRtcManager();
             if (viewportManager == null) {
                 Log.e(TAG, "Cannot reuse session: viewportManager is null");
                 Toast.makeText(this, "Cannot reuse session - viewport manager not available", Toast.LENGTH_LONG).show();
@@ -697,7 +712,19 @@ public class WebRtcActivity extends AppCompatActivity {
             return; // Don't create new connection
         }
 
-        // Start websocket connection - create new session
+        // Auto-switch: try local signaling if device is on local network
+        String nodeId = extractNodeIdFromChannelName();
+        if (nodeId != null) {
+            EspApplication espApp = (EspApplication) getApplicationContext();
+            EspLocalDevice localDevice = espApp.localDeviceMap.get(nodeId);
+            if (localDevice != null) {
+                Log.d(TAG, "Device " + nodeId + " available locally, using local signaling");
+                initLocalSignaling(localDevice);
+                return;
+            }
+        }
+
+        // Fall back to cloud KVS websocket signaling - create new session
         initWsConnection();
 
         if (!gotException && isValidClient()) {
@@ -705,6 +732,73 @@ public class WebRtcActivity extends AppCompatActivity {
         } else {
             notifySignalingConnectionFailed();
         }
+    }
+
+    /**
+     * Extract nodeId from the channel name (format: "esp-v1-<nodeId>").
+     */
+    private String extractNodeIdFromChannelName() {
+        String channelName = EspApplication.channelName;
+        if (channelName != null && channelName.startsWith(CHANNEL_NAME_PREFIX)) {
+            return channelName.substring(CHANNEL_NAME_PREFIX.length());
+        }
+        return null;
+    }
+
+    /**
+     * Initialize local signaling for WebRTC over the device's local control HTTP transport.
+     */
+    private void initLocalSignaling(EspLocalDevice localDevice) {
+        if (mClientId == null || mClientId.isEmpty()) {
+            mClientId = LOCAL_PEER_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8);
+        }
+
+        localClient = new LocalSignalingClient(
+            localDevice,
+            mClientId,
+            // onSdpAnswer
+            (LocalSignalingClient.StringCallback) (String sdp) -> {
+                Log.d(TAG, "Local signaling: SDP answer received");
+                final SessionDescription sdpAnswer = new SessionDescription(SessionDescription.Type.ANSWER, sdp);
+                localPeer.setRemoteDescription(new KinesisVideoSdpObserver() {
+                    @Override
+                    public void onCreateFailure(String error) {
+                        super.onCreateFailure(error);
+                        Log.e(TAG, "Failed to set remote description: " + error);
+                    }
+                }, sdpAnswer);
+                peerConnectionFoundMap.put(mClientId, localPeer);
+            },
+            // onIceCandidate
+            (LocalSignalingClient.StringCallback) (String candidateJson) -> {
+                Log.d(TAG, "Local signaling: ICE candidate received");
+                IceCandidate candidate = LocalSignalingClient.parseIceCandidateJson(candidateJson);
+                if (candidate != null) {
+                    localPeer.addIceCandidate(candidate);
+                } else {
+                    Log.e(TAG, "Failed to parse ICE candidate from local signaling");
+                }
+            },
+            // onError — fall back to KVS
+            (LocalSignalingClient.StringCallback) (String error) -> {
+                Log.w(TAG, "Local signaling failed: " + error + ", falling back to KVS");
+                runOnUiThread(() -> {
+                    if (localClient != null) {
+                        localClient.disconnect();
+                        localClient = null;
+                    }
+                    initWsConnection();
+                    if (!gotException && isValidClient()) {
+                        Toast.makeText(WebRtcActivity.this, "Signaling Connected (cloud fallback)", Toast.LENGTH_LONG).show();
+                    } else {
+                        notifySignalingConnectionFailed();
+                    }
+                });
+            }
+        );
+
+        // Create SDP offer — this triggers the local signaling flow
+        createSdpOffer();
     }
 
     private void notifySignalingConnectionFailed() {
@@ -865,7 +959,7 @@ public class WebRtcActivity extends AppCompatActivity {
         } else {
             // Reuse session - transfer video from viewport
             Log.d(TAG, "Reusing session - initializing renderer with viewport's EglBase");
-            com.espressif.ui.webrtc.WebRtcViewportManager viewportManager = com.espressif.EspApplication.getViewportWebRtcManager();
+            WebRtcViewportManager viewportManager = EspApplication.getViewportWebRtcManager();
             if (viewportManager != null) {
                 org.webrtc.EglBase viewportEglBase = viewportManager.getEglBase();
                 if (viewportEglBase != null) {
@@ -901,20 +995,20 @@ public class WebRtcActivity extends AppCompatActivity {
         androidx.compose.ui.platform.ComposeView mediaToggleView =
                 findViewById(R.id.media_toggle_compose_view);
         if (mediaToggleView != null) {
-            com.espressif.ui.composables.CameraControlsKt.initLandscapeControls(
+            CameraControlsKt.initLandscapeControls(
                     mediaToggleView,
                     new Runnable() {
                         @Override
                         public void run() {
                             userStoppedSession = true;
                             if (reuseSession) {
-                                com.espressif.EspApplication.clearLandscapeSessionReferences();
-                                com.espressif.ui.webrtc.WebRtcViewportManager manager =
-                                        com.espressif.EspApplication.getViewportWebRtcManager();
+                                EspApplication.clearLandscapeSessionReferences();
+                                WebRtcViewportManager manager =
+                                        EspApplication.getViewportWebRtcManager();
                                 if (manager != null) {
                                     manager.stop();
                                 }
-                                com.espressif.EspApplication.clearViewportWebRtcManager();
+                                EspApplication.clearViewportWebRtcManager();
                                 // The WebRtcActivity's localPeer/remoteVideoTrack/rootEglBase
                                 // fields were aliased from the viewport (onPostCreate L645-647).
                                 // manager.stop() just disposed those natives — null the aliases
@@ -1000,9 +1094,14 @@ public class WebRtcActivity extends AppCompatActivity {
 
                 super.onIceCandidate(iceCandidate);
 
-                final Message message = createIceCandidateMessage(iceCandidate);
-                Log.d(TAG, "Sending IceCandidate to remote peer " + iceCandidate);
-                client.sendIceCandidate(message);  /* Send to Peer */
+                if (localClient != null) {
+                    Log.d(TAG, "Sending IceCandidate via local signaling");
+                    localClient.sendIceCandidate(iceCandidate);
+                } else {
+                    final Message message = createIceCandidateMessage(iceCandidate);
+                    Log.d(TAG, "Sending IceCandidate to remote peer " + iceCandidate);
+                    client.sendIceCandidate(message);  /* Send to Peer */
+                }
             }
 
             @Override
@@ -1038,13 +1137,23 @@ public class WebRtcActivity extends AppCompatActivity {
             public void onIceConnectionChange(final PeerConnection.IceConnectionState iceConnectionState) {
                 super.onIceConnectionChange(iceConnectionState);
                 if (iceConnectionState == PeerConnection.IceConnectionState.FAILED) {
-                    // Stay on screen like master branch - don't finish() or tear down
-                    // The connection may recover or user can navigate away manually
-                    Log.w(TAG, "ICE connection failed - staying on screen");
+                    // ICE FAILED is terminal — no recovery without renegotiation.
+                    Log.w(TAG, "ICE connection failed - finishing activity");
                     isStreamActive = false;
                     runOnUiThread(() -> {
                         if (!isFinishing()) {
                             showStreamEndedWithDuration("Connection to peer failed!");
+                            if (reuseSession) {
+                                EspApplication.clearLandscapeSessionReferences();
+                                WebRtcViewportManager manager =
+                                        EspApplication.getViewportWebRtcManager();
+                                if (manager != null) {
+                                    manager.stop();
+                                }
+                                EspApplication.clearViewportWebRtcManager();
+                                reuseSession = false;
+                            }
+                            finish();
                         }
                     });
                 } else if (iceConnectionState == PeerConnection.IceConnectionState.DISCONNECTED) {
@@ -1062,6 +1171,10 @@ public class WebRtcActivity extends AppCompatActivity {
                         streamStartTime = System.currentTimeMillis();
                         isStreamActive = true;
                         Log.i(TAG, "Stream started - duration tracking began");
+                        // Peer connected — nothing left to poll for.
+                        if (localClient != null) {
+                            localClient.stopPolling();
+                        }
                     }
                     runOnUiThread(() -> Toast.makeText(getApplicationContext(), "Connected to peer!", Toast.LENGTH_LONG).show());
                     runOnUiThread(() -> {
@@ -1419,12 +1532,17 @@ public class WebRtcActivity extends AppCompatActivity {
 
                 localPeer.setLocalDescription(new KinesisVideoSdpObserver(), sessionDescription);
 
-                final Message sdpOfferMessage = Message.createOfferMessage(sessionDescription, mClientId);
-
-                if (isValidClient()) {
-                    client.sendSdpOffer(sdpOfferMessage);
+                if (localClient != null) {
+                    Log.d(TAG, "SDP Offer created, sending via local signaling");
+                    localClient.sendSdpOffer(sessionDescription.description);
                 } else {
-                    notifySignalingConnectionFailed();
+                    final Message sdpOfferMessage = Message.createOfferMessage(sessionDescription, mClientId);
+
+                    if (isValidClient()) {
+                        client.sendSdpOffer(sdpOfferMessage);
+                    } else {
+                        notifySignalingConnectionFailed();
+                    }
                 }
             }
         }, sdpMediaConstraints);

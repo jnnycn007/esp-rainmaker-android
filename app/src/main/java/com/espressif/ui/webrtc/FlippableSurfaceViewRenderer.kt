@@ -17,6 +17,7 @@ package com.espressif.ui.webrtc
 import android.content.Context
 import android.graphics.Matrix
 import android.util.AttributeSet
+import android.view.SurfaceHolder
 import com.espressif.webrtc.WebRtcConstants
 import org.webrtc.JavaI420Buffer
 import org.webrtc.SurfaceViewRenderer
@@ -36,7 +37,42 @@ class FlippableSurfaceViewRenderer @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : SurfaceViewRenderer(context, attrs) {
 
+    /**
+     * Fired on the surface lifecycle thread when the underlying SurfaceHolder reports
+     * the surface has been destroyed (tab switch, AndroidView removal from composition,
+     * activity stop, etc.). The owner uses it to detachRenderer() so the manager can
+     * schedule an idle stop instead of streaming into a void.
+     */
+    var onSurfaceDestroyed: (() -> Unit)? = null
+
+    /**
+     * Stable back-reference set by WebRtcViewportManager.attachRenderer() and cleared by
+     * detachRenderer(). Used by surfaceDestroyed() to detach without depending on a
+     * recomposition-captured manager reference (which can be null if the Compose `update`
+     * lambda last ran while webRtcManager was momentarily null).
+     */
+    internal var attachedManager: WebRtcViewportManager? = null
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        // Do NOT detach the renderer from the manager here. surfaceDestroyed fires
+        // on every BG/FG transition (surface flap), and detaching would arm the
+        // idle-stop that kills a healthy session waiting to resume.
+        //
+        // The manager is correctly notified of "view truly going away" via:
+        //   1. AndroidView.onRelease — fires only when the AndroidView leaves composition
+        //   2. The surface watchdog v3/v5/v6 predicates — catch surface-dead while RUNNING
+        //
+        // The legacy `onSurfaceDestroyed` callback is preserved for compatibility,
+        // but the `attachedManager` back-reference path is intentionally NOT invoked.
+        try {
+            onSurfaceDestroyed?.invoke()
+        } catch (_: Exception) {
+        }
+        super.surfaceDestroyed(holder)
+    }
+
     override fun onFrame(frame: VideoFrame) {
+        attachedManager?.notifyRendered(this)
         if (!WebRtcConstants.FLIP_VIDEO_VERTICAL) {
             super.onFrame(frame)
             return

@@ -240,6 +240,7 @@ class AppConstants {
         const val MDNS_CHALLENGE_RESP_SERVICE_TYPE = "_esp_rmaker_chal_resp._tcp."
         const val LOCAL_CONTROL_ENDPOINT = "esp_local_ctrl/control"
         const val LOCAL_SESSION_ENDPOINT = "esp_local_ctrl/session"
+        const val WEBRTC_SIGNAL_ENDPOINT = "webrtc_signal"
         const val MDNS_ATTR_NETWORK_NAME = "nn"
 
         const val CURRENT_VERSION = "v1"

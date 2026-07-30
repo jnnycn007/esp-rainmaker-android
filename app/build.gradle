@@ -301,6 +301,7 @@ dependencies {
 
     implementation libs.lifecycle.viewmodel.ktx
     implementation libs.lifecycle.runtime.ktx
+    implementation libs.lifecycle.process
 
     implementation libs.appcompat
     implementation libs.constraintlayout

@@ -100,10 +100,24 @@ public class EspLocalTransport implements Transport {
             byte[] byteChunk = new byte[4096];
             ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
             InputStream is = urlConnection.getInputStream();
-            while ((n = is.read(byteChunk)) > 0) {
-                outputStream.write(byteChunk, 0, n);
+            try {
+                while ((n = is.read(byteChunk)) > 0) {
+                    outputStream.write(byteChunk, 0, n);
+                }
+            } finally {
+                is.close();
             }
             responseBytes = outputStream.toByteArray();
+        } else {
+            // Drain error stream so connection can be reused via keep-alive
+            InputStream errStream = urlConnection.getErrorStream();
+            if (errStream != null) {
+                try {
+                    while (errStream.read() != -1) { }
+                } finally {
+                    errStream.close();
+                }
+            }
         }
 
         return responseBytes;

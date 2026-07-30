@@ -198,24 +198,41 @@ public class EspLocalDevice {
 
                 @Override
                 public void onFailure(Exception e) {
-                    initSession(new ResponseListener() {
-
-                        @Override
-                        public void onSuccess(byte[] returnData) {
-                            Log.d(TAG, "======== Session established again");
-                            sendData(path, data, listener);
-                        }
-
-                        @Override
-                        public void onFailure(Exception e) {
-                            e.printStackTrace();
-                            if (listener != null) {
-                                listener.onFailure(new RuntimeException("Failed to create session."));
-                            }
-                        }
-                    });
+                    // Do NOT call initSession() here — it would create a new
+                    // transport + session, invalidating the security context for
+                    // any concurrent callers (e.g. signaling polls running alongside
+                    // param updates).  Instead, just mark the session as failed and
+                    // report the error.  The next sendData() call will re-establish
+                    // the session via the (session == null || !session.isEstablished())
+                    // check above.
+                    Log.e(TAG, "sendDataToDevice failed: " + e.getMessage());
+                    sessionState = SessionState.FAILED;
+                    if (listener != null) {
+                        listener.onFailure(e);
+                    }
                 }
             });
+        }
+    }
+
+    /**
+     * Acquire the session's request lock to hold it across multiple
+     * {@link #sendData} calls (e.g. fragmented signaling messages).
+     * Caller MUST call {@link #releaseRequestLock()} only if this returns true.
+     *
+     * @return true if the lock was acquired, false if session is unavailable.
+     */
+    public boolean acquireRequestLock() throws InterruptedException {
+        if (session != null) {
+            session.acquireRequestLock();
+            return true;
+        }
+        return false;
+    }
+
+    public void releaseRequestLock() {
+        if (session != null) {
+            session.releaseRequestLock();
         }
     }
 

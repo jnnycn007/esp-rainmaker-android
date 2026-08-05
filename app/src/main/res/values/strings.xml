@@ -129,6 +129,8 @@
     <string name="error_no_thread_network">No Active Thread Border Router</string>
     <string name="error_dataset_invalid">Invalid Dataset</string>
     <string name="error_wechat_app_not_installed">Please install WeChat application</string>
+    <string name="error_google_sign_in">Google sign-in failed. Please try again.</string>
+    <string name="error_no_google_account">No Google account found on this device. Please add a Google account and try again.</string>
     <string name="error_user_id_not_found">Error ! User ID not found</string>
     <string name="error_pending_dataset_not_supported">Device already has dataset. Dataset update is not supported for this device.</string>
 

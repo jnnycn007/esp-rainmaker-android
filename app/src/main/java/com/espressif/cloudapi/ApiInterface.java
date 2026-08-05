@@ -83,6 +83,11 @@ public interface ApiInterface {
                                            @Field("wechat_token_only") boolean weChatTokenOnly,
                                            @Field("redirect_uri") String redirect_uri);
 
+    // Exchange an ID token issued by a federated provider (obtained from the provider's own
+    // account picker on the device) for RainMaker tokens.
+    @POST
+    Call<ResponseBody> federatedLogin(@Url String url, @Body JsonObject body);
+
     // Get Supported Versions
     @GET
     Call<ResponseBody> getSupportedVersions(@Url String url);

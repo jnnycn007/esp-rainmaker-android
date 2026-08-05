@@ -414,6 +414,103 @@ public class ApiManager {
         }
     }
 
+    /**
+     * Log in with the Google ID token received from the native Google account picker, instead of
+     * opening the hosted authorize URL in a browser.
+     *
+     * @param googleIdToken Google ID token of the account the user selected.
+     */
+    public void loginWithGoogleIdToken(String googleIdToken, final ApiResponseListener listener) {
+        federatedLogin(AppConstants.FEDERATED_PROVIDER_GOOGLE, googleIdToken, true, listener);
+    }
+
+    /**
+     * Same exchange as {@link #loginWithGoogleIdToken(String, ApiResponseListener)}, but the
+     * session is not stored. Only the refresh token is returned to the caller, so that it can be
+     * sent to the Matter controller without changing the user logged in to the app.
+     */
+    public void loginWithGoogleIdTokenForController(String googleIdToken, final ApiResponseListener listener) {
+        federatedLogin(AppConstants.FEDERATED_PROVIDER_GOOGLE, googleIdToken, false, listener);
+    }
+
+    /**
+     * Exchange an ID token issued by a federated identity provider for RainMaker tokens.
+     *
+     * @param provider        identity provider that issued the token, as named by the backend.
+     * @param providerIdToken ID token issued by that provider for the account the user selected.
+     * @param saveSession     when true the returned tokens become the session of the app, when
+     *                        false only the refresh token is passed back through the listener.
+     */
+    private void federatedLogin(String provider, String providerIdToken, final boolean saveSession,
+                                final ApiResponseListener listener) {
+
+        String url = getBaseUrl() + AppConstants.URL_FEDERATED_AUTH + AppConstants.PATH_SEPARATOR + provider;
+        Log.d(TAG, "Federated login with " + provider + ", URL : " + url);
+
+        JsonObject body = new JsonObject();
+        body.addProperty(AppConstants.KEY_ID_TOKEN, providerIdToken);
+
+        try {
+            apiInterface.federatedLogin(url, body).enqueue(new Callback<ResponseBody>() {
+
+                @Override
+                public void onResponse(Call<ResponseBody> call, Response<ResponseBody> response) {
+
+                    Log.d(TAG, "Federated login, Response code  : " + response.code());
+                    try {
+                        if (response.isSuccessful()) {
+
+                            String jsonResponse = response.body().string();
+                            JSONObject jsonObject = new JSONObject(jsonResponse);
+
+                            if (!saveSession) {
+                                String cRefreshToken = getSessionToken(jsonObject, "refreshtoken",
+                                        AppConstants.KEY_REFRESH_TOKEN);
+                                if (TextUtils.isEmpty(cRefreshToken)) {
+                                    Log.e(TAG, "Refresh token cannot be empty");
+                                    listener.onResponseFailure(new RuntimeException("Failed to login"));
+                                    return;
+                                }
+                                Bundle data = new Bundle();
+                                data.putString(AppConstants.KEY_REFRESH_TOKEN, cRefreshToken);
+                                listener.onSuccess(data);
+                                return;
+                            }
+
+                            if (!saveSessionTokens(jsonObject)) {
+                                Log.e(TAG, "Tokens cannot be empty");
+                                listener.onResponseFailure(new RuntimeException("Failed to login"));
+                                return;
+                            }
+
+                            getTokenAndUserId();
+                            listener.onSuccess(null);
+
+                        } else {
+                            String jsonErrResponse = response.errorBody().string();
+                            processError(jsonErrResponse, listener, "Failed to login");
+                        }
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        listener.onResponseFailure(e);
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                        listener.onResponseFailure(e);
+                    }
+                }
+
+                @Override
+                public void onFailure(Call<ResponseBody> call, Throwable t) {
+                    t.printStackTrace();
+                    listener.onNetworkFailure(new Exception(t));
+                }
+            });
+        } catch (Exception e) {
+            e.printStackTrace();
+            listener.onNetworkFailure(e);
+        }
+    }
+
     public void getOAuthTokenForController(String code, final ApiResponseListener listener) {
 
         Log.d(TAG, "Get OAuth Token for Matter Controller");
@@ -5185,6 +5282,55 @@ public class ApiManager {
             e.printStackTrace();
             listener.onResponseFailure(new RuntimeException(errMsg));
         }
+    }
+
+    /**
+     * Makes the tokens of a successful login response the session of the app.
+     * <p>
+     * Nothing is stored unless every token is present, so a response that is missing tokens cannot
+     * leave the app holding a half written session that looks like a successful login.
+     *
+     * @return true when the session was saved, false when the response was missing a token.
+     */
+    private boolean saveSessionTokens(JSONObject response) {
+
+        String newIdToken = getSessionToken(response, "idtoken", AppConstants.KEY_ID_TOKEN);
+        String newAccessToken = getSessionToken(response, "accesstoken", AppConstants.KEY_ACCESS_TOKEN);
+        String newRefreshToken = getSessionToken(response, "refreshtoken", AppConstants.KEY_REFRESH_TOKEN);
+
+        if (TextUtils.isEmpty(newIdToken) || TextUtils.isEmpty(newAccessToken)
+                || TextUtils.isEmpty(newRefreshToken)) {
+            return false;
+        }
+
+        idToken = newIdToken;
+        accessToken = newAccessToken;
+        refreshToken = newRefreshToken;
+        isOAuthLogin = true;
+
+        SharedPreferences.Editor editor = sharedPreferences.edit();
+        editor.putString(AppConstants.KEY_ID_TOKEN, idToken);
+        editor.putString(AppConstants.KEY_ACCESS_TOKEN, accessToken);
+        editor.putString(AppConstants.KEY_REFRESH_TOKEN, refreshToken);
+        editor.putBoolean(AppConstants.KEY_IS_OAUTH_LOGIN, true);
+        editor.apply();
+        return true;
+    }
+
+    /**
+     * Reads a session token out of a login response. RainMaker APIs name the tokens "idtoken"
+     * while the OAuth token endpoint names them "id_token", so accept either spelling.
+     */
+    private static String getSessionToken(JSONObject response, String key, String oauthKey) {
+
+        String token = response.optString(key);
+        if (TextUtils.isEmpty(token)) {
+            token = response.optString(oauthKey);
+        }
+        if (TextUtils.isEmpty(token)) {
+            Log.e(TAG, key + " is missing in the login response");
+        }
+        return token;
     }
 
     private String getBaseUrl() {

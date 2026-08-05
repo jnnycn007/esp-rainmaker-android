@@ -21,8 +21,10 @@ import android.text.TextUtils
 import android.util.Log
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.content.res.AppCompatResources
+import androidx.lifecycle.lifecycleScope
 import com.espressif.AppConstants
 import com.espressif.EspApplication
 import com.espressif.NetworkApiManager
@@ -36,6 +38,7 @@ import com.espressif.ui.Utils
 import com.espressif.ui.models.EspNode
 import com.espressif.ui.models.Service
 import com.espressif.ui.models.UpdateEvent
+import com.espressif.ui.user_module.GoogleSignInManager
 import com.espressif.utils.NodeUtils.Companion.getService
 import com.espressif.utils.ParamUtils
 import com.google.gson.JsonObject
@@ -194,10 +197,7 @@ class ControllerLoginActivity : AppCompatActivity() {
         }
 
         binding.btnLoginWithGoogle.layoutBtn.setOnClickListener {
-            val uriStr = BuildConfig.GOOGLE_URL
-            val uri = Uri.parse(uriStr)
-            val openURL = Intent(Intent.ACTION_VIEW, uri)
-            startActivity(openURL)
+            loginUsingGoogle()
         }
 
         binding.etPassword.setOnEditorActionListener { v, actionId, event ->
@@ -206,6 +206,104 @@ class ControllerLoginActivity : AppCompatActivity() {
             }
             false
         }
+    }
+
+    /**
+     * Shows the Google account picker and sets up the controller with the account the user selects.
+     */
+    private fun loginUsingGoogle() {
+
+        showLoading()
+
+        GoogleSignInManager(this).signIn(
+            lifecycleScope,
+            object : GoogleSignInManager.GoogleSignInListener {
+
+                override fun onSignInSuccess(idToken: String) {
+                    getTokenForGoogleUser(idToken)
+                }
+
+                override fun onSignInCancelled() {
+                    hideLoading()
+                }
+
+                override fun onNoGoogleAccount() {
+                    hideLoading()
+                    Toast.makeText(
+                        this@ControllerLoginActivity,
+                        R.string.error_no_google_account,
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+
+                override fun onSignInUnavailable() {
+                    hideLoading()
+                    loginUsingHostedGoogleFlow()
+                }
+
+                override fun onSignInFailure(exception: Exception) {
+                    hideLoading()
+                    Toast.makeText(
+                        this@ControllerLoginActivity,
+                        R.string.error_google_sign_in,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            })
+    }
+
+    /**
+     * Google login through the RainMaker hosted authorize URL, opened in a browser. Used when the
+     * account picker cannot be shown, either because no Google web client id is configured for
+     * this build or because Credential Manager is not usable on the device.
+     */
+    private fun loginUsingHostedGoogleFlow() {
+        Log.d(TAG, "Google account picker is not available, using the hosted login flow")
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.GOOGLE_URL)))
+    }
+
+    private fun getTokenForGoogleUser(idToken: String) {
+
+        val apiManager = ApiManager.getInstance(applicationContext)
+
+        apiManager.loginWithGoogleIdTokenForController(idToken, object : ApiResponseListener {
+
+            override fun onSuccess(data: Bundle?) {
+                Log.d(TAG, "Received success in Google login")
+                if (data != null) {
+                    sendRefreshToken(data.getString(AppConstants.KEY_REFRESH_TOKEN, ""))
+                }
+            }
+
+            override fun onResponseFailure(exception: Exception) {
+                hideLoading()
+                if (exception is CloudException) {
+                    Utils.showAlertDialog(
+                        this@ControllerLoginActivity,
+                        getString(R.string.dialog_title_login_failed),
+                        exception.message,
+                        false
+                    )
+                } else {
+                    Utils.showAlertDialog(
+                        this@ControllerLoginActivity,
+                        "",
+                        getString(R.string.dialog_title_login_failed),
+                        false
+                    )
+                }
+            }
+
+            override fun onNetworkFailure(exception: Exception) {
+                hideLoading()
+                Utils.showAlertDialog(
+                    this@ControllerLoginActivity,
+                    getString(R.string.dialog_title_no_network),
+                    getString(R.string.dialog_msg_no_network),
+                    false
+                )
+            }
+        })
     }
 
     private fun signInUser() {

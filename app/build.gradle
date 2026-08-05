@@ -58,6 +58,12 @@ def defaultChinaTermsOfUseUrl = "https://rainmaker.espressif.com/zh/terms-of-use
 
 // Please configure WeChat App id to support WeChat login for China region
 def weChatIdForLogin = "your_we_chat_id"
+
+// Please configure the Google OAuth 2.0 "Web application" client id to support Google login.
+// This is the same web client id that is configured as the Google identity provider for the
+// RainMaker deployment. It is required by Credential Manager to issue a Google ID token that
+// the RainMaker backend can verify.
+def googleWebClientIdForLogin = "847141165224-5r4e8kn1rg3vu1tltq6b4qouvk5nquet.apps.googleusercontent.com"
 def defaultJPushAppKey = "your jpush app key" // put your default value here
 def defaultJPushChannel = "developer-default" // put your default value here
 def defaultAlexaRedirectHost = "your_host_value" // put your default value here
@@ -95,8 +101,8 @@ android {
         applicationId "com.espressif.rainmaker"
         minSdkVersion 27
         targetSdkVersion 35
-        versionCode 218
-        versionName "3.15.0 - ${getGitHash()}"
+        versionCode 220
+        versionName "3.16.0 - ${getGitHash()}"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField "String", "GitHash", "\"${getGitHash()}\""
@@ -197,6 +203,7 @@ android {
 
         buildConfigField "String", "GITHUB_URL", '"' + gitHubUrl + '"'
         buildConfigField "String", "GOOGLE_URL", '"' + googleUrl + '"'
+        buildConfigField "String", "GOOGLE_WEB_CLIENT_ID", '"' + localProperties.getProperty("googleWebClientId", googleWebClientIdForLogin) + '"'
         buildConfigField "String", "APPLE_URL", '"' + appleUrl + '"'
         buildConfigField "String", "APPLE_URL_FOR_CHINA", '"' + appleUrlForChina + '"'
 
@@ -341,6 +348,11 @@ dependencies {
     implementation libs.play.services.base
     implementation libs.play.services.home
     implementation libs.play.services.threadnetwork
+
+    // Google sign-in through Credential Manager (native account selection)
+    implementation libs.credentials
+    implementation libs.credentials.play.services.auth
+    implementation libs.googleid
     
     implementation libs.esp.idf.provisioning.android
     implementation libs.code.scanner

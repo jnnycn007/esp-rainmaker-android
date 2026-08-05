@@ -29,8 +29,7 @@
                     android:layout_height="wrap_content"
                     android:layout_centerInParent="true"
                     android:padding="12dp"
-                    android:src="@drawable/ic_title_rainmaker"
-                    app:tint="@android:color/white" />
+                    android:src="@drawable/ic_title_rainmaker" />
 
             </RelativeLayout>
 

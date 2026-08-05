@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package rmaker_webrtc_signal;
+
+option java_package = "com.espressif.webrtc.proto";
+option java_outer_classname = "WebrtcSignalProto";
+
+enum WebrtcSignalMsgType {
+    TypeCmdOffer = 0;
+    TypeRespOffer = 1;
+    TypeCmdPoll = 2;
+    TypeRespPoll = 3;
+    TypeCmdIceCandidate = 4;
+    TypeRespIceCandidate = 5;
+    TypeAnswer = 6;
+    TypeIceCandidateMsg = 7;
+}
+
+enum WebrtcSignalStatus {
+    Success = 0;
+    Fail = 1;
+    InvalidParam = 2;
+    Pending = 3;
+}
+
+/* Structured SDP */
+message SessionDescription {
+    string sdp = 1;
+    string type = 2;   /* "offer" or "answer" */
+}
+
+/*
+ * A single outbound signaling message from device (in poll response).
+ * SDP answers use structured SessionDescription.
+ * ICE candidates use standard JSON format.
+ */
+message SignalingMessage {
+    WebrtcSignalMsgType type = 1;
+    oneof content {
+        SessionDescription session_desc = 2;  /* For TypeAnswer */
+        string ice_candidate_json = 3;        /* For TypeIceCandidateMsg — standard JSON */
+    }
+}
+
+/*
+ * Fragmentation support.
+ * When a serialized protobuf message exceeds the transport limit (~2KB),
+ * it is split into chunks. Each chunk is wrapped in a WebrtcSignalPayload
+ * with only 'fragment' set (no payload oneof). The receiver reassembles
+ * all chunks by offset, then unpacks the full protobuf message.
+ */
+message FragmentInfo {
+    uint32 offset = 1;
+    uint32 total_len = 2;
+    bytes data = 3;       /* Raw chunk bytes of the serialized protobuf */
+}
+
+/* --- Commands (App → Device) --- */
+message CmdOffer {
+    string peer_id = 1;
+    SessionDescription offer = 2;
+}
+
+message CmdPoll {
+    string peer_id = 1;
+}
+
+message CmdIceCandidate {
+    string peer_id = 1;
+    string payload = 2;  /* Standard ICE candidate JSON */
+}
+
+/* --- Responses (Device → App) --- */
+/*
+ * All responses include an optional 'messages' field for piggybacking
+ * queued signaling messages (answer, ICE candidates) onto any response.
+ * This eliminates the need for a separate poll round-trip when messages
+ * are already available at response time.
+ */
+message RespOffer {
+    WebrtcSignalStatus status = 1;
+    string peer_id = 2;
+    repeated SignalingMessage messages = 3;
+}
+
+message RespPoll {
+    WebrtcSignalStatus status = 1;
+    repeated SignalingMessage messages = 2;
+}
+
+message RespIceCandidate {
+    WebrtcSignalStatus status = 1;
+    repeated SignalingMessage messages = 2;
+}
+
+/* --- Envelope --- */
+message WebrtcSignalPayload {
+    WebrtcSignalMsgType msg = 1;
+    uint32 version = 2;
+    FragmentInfo fragment = 3;
+    oneof payload {
+        CmdOffer cmd_offer = 10;
+        RespOffer resp_offer = 11;
+        CmdPoll cmd_poll = 12;
+        RespPoll resp_poll = 13;
+        CmdIceCandidate cmd_ice_candidate = 14;
+        RespIceCandidate resp_ice_candidate = 15;
+    }
+}

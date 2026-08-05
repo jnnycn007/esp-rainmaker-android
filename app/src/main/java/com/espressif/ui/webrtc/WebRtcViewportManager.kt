@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.LifecycleOwner
 import com.amazonaws.services.kinesisvideo.model.ChannelRole
+import com.espressif.local_control.EspLocalDevice
 import com.espressif.webrtc.*
 import com.espressif.ui.webrtc.WebRtcChannelInfo
 import org.webrtc.AudioSource
@@ -46,7 +47,12 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.Date
+import android.os.Handler
+import android.os.Looper
+import org.webrtc.EglRenderer.FrameListener
 
 /**
  * Holds a snapshot of WebRTC video stats for UI display.
@@ -67,6 +73,20 @@ data class WebRtcStats(
     val streamDurationMs: Long = 0
 )
 
+/**
+ * STATE CONTRACT:
+ *   - state == RUNNING|STARTING means "actively trying to play" — UI should treat as 'playing'
+ *   - state == STOPPING|STOPPED inside a retry/fallback chain is INTERNAL — UI must not react
+ *   - onTerminallyStopped() is the ONLY signal the UI should use to flip isPlaying back to false
+ *
+ * Callers driving a fallback (e.g. local→KVS) MUST call markRestartInFlight() on the
+ * outgoing manager before invoking stop() so the manager does not fire onTerminallyStopped
+ * during the intermediate cleanup. The flag is cleared automatically when start() /
+ * startLocal() transitions back to RUNNING.
+ *
+ * Explicit user-initiated stops (a Stop button tap, etc.) MUST call userStop() instead of
+ * stop() so onTerminallyStopped fires regardless of any restart-in-flight flag.
+ */
 class WebRtcViewportManager(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner? = null
@@ -76,10 +96,167 @@ class WebRtcViewportManager(
     private var rootEglBase: EglBase? = null
     @Volatile private var isStarting = false
     private var peerConnectionFactory: PeerConnectionFactory? = null
+    // Held so stop() can call release() on the Java-side ADM. PeerConnectionFactory.dispose()
+    // only drops its reference — without this, native audio capture/playback threads keep
+    // running and the mic stays hot after stop().
+    private var audioDeviceModule: org.webrtc.audio.AudioDeviceModule? = null
     @Volatile private var localPeer: PeerConnection? = null
     private var remoteView: SurfaceViewRenderer? = null
     private var remoteVideoTrack: VideoTrack? = null
     private var remoteAudioTrack: AudioTrack? = null
+
+    // Cached params from the most recent start() / startLocal() call. Used by
+    // restartIfStopped() to replay the original entry point after the session has
+    // been torn down by the process-level ON_STOP observer.
+    private sealed class CachedStartParams {
+        data class Kvs(
+            val channelArn: String,
+            val streamArn: String?,
+            val wssEndpoint: String,
+            val webrtcEndpoint: String?,
+            val region: String,
+            val iceServers: List<IceServer>,
+            val dataEndpoint: String?,
+            val surfaceViewRenderer: SurfaceViewRenderer,
+            val isMaster: Boolean,
+            val clientId: String?
+        ) : CachedStartParams()
+
+        data class Local(
+            val localDevice: EspLocalDevice,
+            val surfaceViewRenderer: SurfaceViewRenderer,
+            val clientId: String?
+        ) : CachedStartParams()
+    }
+    private var lastStartParams: CachedStartParams? = null
+
+    // Tracks every SurfaceViewRenderer currently attached to this session. When the set
+    // goes empty the session has no UI consumer, so we schedule a delayed stop — a short
+    // gap (e.g. orientation transfer) does not tear the session down, but a long idle
+    // window does.
+    private val attachedRenderers = mutableSetOf<SurfaceViewRenderer>()
+    private val attachLock = Any()
+    private val idleStopHandler = Handler(Looper.getMainLooper())
+    private val idleStopRunnable = Runnable {
+        val empty = synchronized(attachLock) { attachedRenderers.isEmpty() }
+        if (empty) {
+            Log.d(TAG, "Idle stop firing: no renderers attached for ${IDLE_STOP_DELAY_MS}ms")
+            stop()
+        }
+    }
+
+    // --- Surface watchdog ---
+    // Detects the case where frames keep arriving from the decoder but no renderer is
+    // actually drawing them (surface dead, e.g. Compose tab switch with parent kept
+    // alive). Compares received-frame delta vs rendered-frame delta every 3s while
+    // state == RUNNING; if received > 0 && rendered == 0, force-detach every renderer
+    // so the existing idle-stop path tears the session down.
+    private val surfaceWatchdogHandler = Handler(Looper.getMainLooper())
+    private val receivedFrameCounter = AtomicLong(0L)
+    private val renderedFrameCounterByRenderer =
+        ConcurrentHashMap<SurfaceViewRenderer, AtomicLong>()
+    private val frameListenerByRenderer =
+        ConcurrentHashMap<SurfaceViewRenderer, FrameListener>()
+    private val lastWatchdogReceivedTotal = AtomicLong(0L)
+    private val lastWatchdogRenderedTotal = AtomicLong(0L)
+    // Consecutive "frames in, nothing rendered" ticks since last reset. We require
+    // rendering to have worked at least once before counting — avoids false-positive
+    // tear-downs during decoder/GPU warm-up.
+    private val watchdogBadTicks = java.util.concurrent.atomic.AtomicInteger(0)
+
+    // Separate, count-only sink registered alongside the renderer sink on the remote
+    // video track. Lets us measure decode-side throughput independently of any single
+    // renderer's surface state.
+    private val countingReceiveSink = org.webrtc.VideoSink {
+        receivedFrameCounter.incrementAndGet()
+    }
+
+    private val surfaceWatchdogRunnable = object : Runnable {
+        override fun run() {
+            try {
+                if (state == ManagerState.RUNNING) {
+                    val curReceived = receivedFrameCounter.get()
+                    val curRendered = renderedFrameCounterByRenderer.values.sumOf { it.get() }
+                    val deltaRcv = curReceived - lastWatchdogReceivedTotal.get()
+                    val deltaRdr = curRendered - lastWatchdogRenderedTotal.get()
+                    lastWatchdogReceivedTotal.set(curReceived)
+                    lastWatchdogRenderedTotal.set(curRendered)
+                    // Only count this tick as bad if rendering has worked before
+                    // (totalRendered > 0) — avoids false positives during decoder
+                    // and GPU surface warm-up. Require N consecutive bad ticks
+                    // before concluding the surface is dead.
+                    if (deltaRcv > 0 && deltaRdr == 0L && curRendered > 0L) {
+                        val bad = watchdogBadTicks.incrementAndGet()
+                        Log.d(TAG, "Surface watchdog: received=$deltaRcv rendered=0 (bad tick $bad/$WATCHDOG_BAD_TICKS_THRESHOLD, totalRendered=$curRendered)")
+                        if (bad >= WATCHDOG_BAD_TICKS_THRESHOLD) {
+                            Log.w(TAG, "Surface watchdog: bad-ticks threshold reached — force-detaching all renderers")
+                            val snap = synchronized(attachLock) { attachedRenderers.toList() }
+                            snap.forEach { r ->
+                                try { detachRenderer(r) } catch (_: Exception) {}
+                            }
+                            watchdogBadTicks.set(0)
+                        }
+                    } else if (synchronized(attachLock) { attachedRenderers.isEmpty() } && curReceived > 0) {
+                        // v5: RUNNING with frames flowing but NO renderer ever attached
+                        // (or all detached due to a Compose transient flap during STARTING).
+                        // The original "totalRendered > 0" predicate never triggers here
+                        // because there's no FrameListener to bump the rendered counter.
+                        val bad = watchdogBadTicks.incrementAndGet()
+                        Log.d(TAG, "Surface watchdog: state=RUNNING but no renderers attached (received total=$curReceived, bad tick $bad/$WATCHDOG_BAD_TICKS_THRESHOLD)")
+                        if (bad >= WATCHDOG_BAD_TICKS_THRESHOLD) {
+                            Log.w(TAG, "Surface watchdog: RUNNING with no UI consumer for $WATCHDOG_BAD_TICKS_THRESHOLD ticks — force-stopping session")
+                            watchdogBadTicks.set(0)
+                            // No renderer to detach; go straight to stop().
+                            stop()
+                        }
+                    } else if (deltaRcv > 0 && deltaRdr == 0L && curRendered == 0L && curReceived > WARM_UP_RECEIVED_THRESHOLD) {
+                        // v6: renderer IS attached but its surface never came up since
+                        // session start (e.g. ProcessLifecycleOwner foreground-restart with
+                        // a renderer whose surface was destroyed in the background). Frames
+                        // arrive in bulk, FrameListener never fires once. Wait until enough
+                        // frames have been received to be sure the session is genuinely
+                        // active before counting bad ticks.
+                        val bad = watchdogBadTicks.incrementAndGet()
+                        Log.d(TAG, "Surface watchdog: rendered=0 despite curReceived=$curReceived — surface dead since startup (bad tick $bad/$WATCHDOG_BAD_TICKS_THRESHOLD)")
+                        if (bad >= WATCHDOG_BAD_TICKS_THRESHOLD) {
+                            Log.w(TAG, "Surface watchdog: rendered=0 after $curReceived frames — force-detaching all renderers")
+                            watchdogBadTicks.set(0)
+                            val snap = synchronized(attachLock) { attachedRenderers.toList() }
+                            snap.forEach { try { detachRenderer(it) } catch (_: Exception) {} }
+                            // Once detached, the v5 branch (RUNNING + no renderers) takes
+                            // over and/or the state-gated idle stop kicks in.
+                        }
+                    } else {
+                        // Healthy tick, or still warming up (totalRendered == 0 with
+                        // received frames below the warm-up threshold).
+                        watchdogBadTicks.set(0)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Watchdog tick error", e)
+            }
+            // Re-schedule unless we've reached a terminal state
+            if (state == ManagerState.RUNNING || state == ManagerState.STARTING) {
+                surfaceWatchdogHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun startSurfaceWatchdog() {
+        surfaceWatchdogHandler.removeCallbacks(surfaceWatchdogRunnable)
+        // Reset baselines so the first tick measures only post-RUNNING activity.
+        lastWatchdogReceivedTotal.set(receivedFrameCounter.get())
+        lastWatchdogRenderedTotal.set(
+            renderedFrameCounterByRenderer.values.sumOf { it.get() }
+        )
+        watchdogBadTicks.set(0)
+        surfaceWatchdogHandler.postDelayed(surfaceWatchdogRunnable, WATCHDOG_INTERVAL_MS)
+        Log.d(TAG, "Surface watchdog started (interval=${WATCHDOG_INTERVAL_MS}ms)")
+    }
+
+    private fun stopSurfaceWatchdog() {
+        surfaceWatchdogHandler.removeCallbacks(surfaceWatchdogRunnable)
+    }
 
     // Local media sending
     private var videoCapturer: VideoCapturer? = null
@@ -106,6 +283,7 @@ class WebRtcViewportManager(
     private var onIncomingAudioMuteChanged: ((muted: Boolean) -> Unit)? = null
 
     private var client: SignalingServiceWebSocketClient? = null
+    private var localClient: LocalSignalingClient? = null
     private var audioManager: AudioManager? = null
     private val peerIceServers = mutableListOf<IceServer>()
     private val peerConnectionFoundMap = mutableMapOf<String, PeerConnection>()
@@ -124,29 +302,41 @@ class WebRtcViewportManager(
     @Volatile private var pendingRenegotiation = false
     private var streamStartTime = 0L
 
+    enum class ManagerState { IDLE, STARTING, RUNNING, STOPPING, STOPPED }
+
+    @Volatile
+    private var state: ManagerState = ManagerState.IDLE
+    @Volatile
+    private var deferredStopRequested: Boolean = false
+    private val stateLock = Any()
+
+    private fun canStart(): Boolean = state == ManagerState.IDLE || state == ManagerState.STOPPED
+    private fun canStop(): Boolean = state != ManagerState.IDLE
+    private fun canRestart(): Boolean = state == ManagerState.STOPPED
+
     private var onConnectionStateChanged: ((Boolean) -> Unit)? = null
     private var onError: ((String) -> Unit)? = null
 
-    // Single-thread executor for media toggle operations (camera open/close is slow; off main thread).
-    private val mediaOpsExecutor = Executors.newSingleThreadExecutor()
+    /**
+     * Fired exactly once per session lifetime when this manager's state transitions to
+     * STOPPED *and* no restart is in flight (or when userStop() was used). UI should
+     * subscribe and flip its 'playing' flag to false here — and ONLY here. See the
+     * STATE CONTRACT kdoc on the class for details.
+     */
+    var onTerminallyStopped: (() -> Unit)? = null
 
-    // Submit a media-toggle op, tolerating a stopping/stopped session: mediaOpsExecutor
-    // is shut down in stop(), so a late toggle would otherwise throw on the UI thread.
-    private fun submitMediaOp(op: () -> Unit) {
-        if (mediaOpsExecutor.isShutdown) {
-            Log.w(TAG, "Media-toggle op ignored — session is stopping")
-            return
-        }
-        try {
-            mediaOpsExecutor.execute(op)
-        } catch (e: RejectedExecutionException) {
-            Log.w(TAG, "Media-toggle op rejected — session stopped")
-        }
-    }
+    @Volatile private var userInitiatedStop = false
+    @Volatile private var restartInFlight = false
+
     // SDP offer retry state
     @Volatile private var sdpAnswerReceived = false
     private var offerAttempt = 0
-    private val offerRetryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val offerRetryHandler = Handler(Looper.getMainLooper())
+
+    // Single-thread executor for media toggle operations (camera open/close is slow; off main thread).
+    // Recreated by start()/startLocal() if previously drained by stop().
+    private var mediaOpsExecutor: java.util.concurrent.ExecutorService =
+        Executors.newSingleThreadExecutor { r -> Thread(r, MEDIA_OPS_THREAD_NAME) }
 
     companion object {
         private const val ENABLE_INTEL_VP8_ENCODER = true
@@ -159,12 +349,36 @@ class WebRtcViewportManager(
         private const val LOCAL_MEDIA_STREAM_LABEL = "KvsLocalMediaStream"
         private const val VIDEO_TRACK_ID = "KvsVideoTrack"
         private const val AUDIO_TRACK_ID = "KvsAudioTrack"
-        private const val VIDEO_WIDTH = 320
+        private const val VIDEO_WIDTH = 240
         private const val VIDEO_HEIGHT = 240
-        private const val VIDEO_FPS = 8
+        private const val VIDEO_FPS = 15
+        // BWE can not probe its way out of "bandwidth limited" state on its own,
+        // so seed it. Without these, libwebrtc default starts at 96 kbps and never
+        // climbs because probing is suppressed once limited.
+        // 200 kbps is the empirical sweet spot for 240x240 @ 15 fps upstream:
+        // - prevents BWE from collapsing to the libwebrtc 96k default (the original
+        //   reason this knob exists)
+        // - low enough that upstream doesn't steal bandwidth from the FHD downstream
+        //   on a shared WiFi link
+        // Higher (400/600k) gave the encoder more headroom on motion-blocky frames
+        // but cut the RX path from 17-22 fps to 9-14 fps. Not worth the trade.
+        private const val VIDEO_MIN_BITRATE_BPS = 200_000
+        private const val VIDEO_START_BITRATE_BPS = 600_000
+        private const val VIDEO_MAX_BITRATE_BPS = 1_500_000
 
         private const val MAX_OFFER_RETRIES = 3
         private const val OFFER_TIMEOUT_MS = 5000L
+
+        // Lowered from 30s — keeping mic/audio capture alive for half a minute with
+        // no UI consumer is too long. 5s still covers brief orientation/transfer gaps.
+        private const val IDLE_STOP_DELAY_MS = 5_000L
+
+        private const val WATCHDOG_INTERVAL_MS = 3_000L
+        private const val WATCHDOG_BAD_TICKS_THRESHOLD = 7
+        private const val WARM_UP_RECEIVED_THRESHOLD = 30L
+
+        private const val MEDIA_OPS_THREAD_NAME = "WebRtcMediaOps"
+        private const val STATS_THREAD_NAME = "WebRtcStats"
 
         /**
          * Pre-initialize the PeerConnectionFactory on a background thread.
@@ -264,7 +478,7 @@ class WebRtcViewportManager(
      * If the connection is already established, triggers SDP renegotiation.
      */
     fun enableVideoSending() {
-        submitMediaOp { enableVideoSendingInternal() }
+        mediaOpsExecutor.execute { enableVideoSendingInternal() }
     }
 
     private fun enableVideoSendingInternal() {
@@ -320,9 +534,11 @@ class WebRtcViewportManager(
             if (peer != null && localVideoTrack != null && localVideoSender == null) {
                 localVideoSender = peer.addTrack(localVideoTrack, listOf(LOCAL_MEDIA_STREAM_LABEL))
                 Log.i(TAG, "Video track added to peer connection (first enable)")
+                applyVideoSenderBitrate(localVideoSender)
+                applyPeerBitrateConfig(peer)
 
-                // Renegotiate if connection is already established
-                if (isStreamActive && client?.isOpen == true) {
+                // Renegotiate if connection is already established (KVS or local signaling)
+                if (isStreamActive && (client?.isOpen == true || localClient != null)) {
                     Log.i(TAG, "Renegotiating to include video track...")
                     renegotiate()
                 } else {
@@ -347,7 +563,7 @@ class WebRtcViewportManager(
      * The track stays in the peer connection so it can be re-enabled without renegotiation.
      */
     fun disableVideoSending() {
-        submitMediaOp { disableVideoSendingInternal() }
+        mediaOpsExecutor.execute { disableVideoSendingInternal() }
     }
 
     private fun disableVideoSendingInternal() {
@@ -390,7 +606,7 @@ class WebRtcViewportManager(
      * Creates the audio pipeline if needed and adds the track to the peer connection.
      */
     fun enableAudioSending() {
-        submitMediaOp { enableAudioSendingInternal() }
+        mediaOpsExecutor.execute { enableAudioSendingInternal() }
     }
 
     private fun enableAudioSendingInternal() {
@@ -418,8 +634,10 @@ class WebRtcViewportManager(
                 localAudioSender = peer.addTrack(localAudioTrack, listOf(LOCAL_MEDIA_STREAM_LABEL))
                 Log.i(TAG, "Audio track added to peer connection (first enable)")
 
-                // Renegotiate if connection is already established
-                if (isStreamActive && client?.isOpen == true) {
+                // Renegotiate if connection is already established (KVS or local signaling).
+                // Mirrors the video-send path so the local-signaling audio toggle does not
+                // silently defer-and-stall when client?.isOpen is false in local mode.
+                if (isStreamActive && (client?.isOpen == true || localClient != null)) {
                     Log.i(TAG, "Renegotiating to include audio track...")
                     renegotiate()
                 } else {
@@ -444,7 +662,7 @@ class WebRtcViewportManager(
      * so it can be re-enabled without renegotiation.
      */
     fun disableAudioSending() {
-        submitMediaOp { disableAudioSendingInternal() }
+        mediaOpsExecutor.execute { disableAudioSendingInternal() }
     }
 
     private fun disableAudioSendingInternal() {
@@ -495,6 +713,48 @@ class WebRtcViewportManager(
         Log.i(TAG, "Local audio track added to peer connection (default send)")
     }
 
+    /**
+     * Override the BWE start point on the PeerConnection so the encoder is not
+     * forced to climb out of the libwebrtc default 96 kbps cold-start.
+     */
+    private fun applyPeerBitrateConfig(peer: PeerConnection) {
+        try {
+            val ok = peer.setBitrate(
+                VIDEO_MIN_BITRATE_BPS,
+                VIDEO_START_BITRATE_BPS,
+                VIDEO_MAX_BITRATE_BPS
+            )
+            Log.i(TAG, "Peer setBitrate min=${VIDEO_MIN_BITRATE_BPS} start=${VIDEO_START_BITRATE_BPS} max=${VIDEO_MAX_BITRATE_BPS} ok=$ok")
+        } catch (t: Throwable) {
+            Log.w(TAG, "applyPeerBitrateConfig failed: ${t.message}")
+        }
+    }
+
+    /**
+     * Cap the per-encoding maxBitrateBps on the video sender so the bitrate
+     * allocator has a real ceiling to aim for instead of the simulcast default.
+     */
+    private fun applyVideoSenderBitrate(sender: org.webrtc.RtpSender?) {
+        if (sender == null) return
+        try {
+            val params = sender.parameters ?: return
+            val encs = params.encodings ?: return
+            if (encs.isEmpty()) {
+                Log.w(TAG, "applyVideoSenderBitrate: no encodings on video sender")
+                return
+            }
+            for (e in encs) {
+                e.minBitrateBps = VIDEO_MIN_BITRATE_BPS
+                e.maxBitrateBps = VIDEO_MAX_BITRATE_BPS
+                e.maxFramerate = VIDEO_FPS
+            }
+            sender.parameters = params
+            Log.i(TAG, "Video sender encoding capped min=${VIDEO_MIN_BITRATE_BPS} max=${VIDEO_MAX_BITRATE_BPS} maxFps=$VIDEO_FPS")
+        } catch (t: Throwable) {
+            Log.w(TAG, "applyVideoSenderBitrate failed: ${t.message}")
+        }
+    }
+
     private fun createVideoCapturer(): VideoCapturer? {
         val enumerator = Camera1Enumerator(false)
         // Try front-facing camera first
@@ -531,8 +791,8 @@ class WebRtcViewportManager(
             Log.e(TAG, "Cannot renegotiate: localPeer is null")
             return
         }
-        if (client?.isOpen != true) {
-            Log.e(TAG, "Cannot renegotiate: signaling client is not open")
+        if (client?.isOpen != true && localClient == null) {
+            Log.e(TAG, "Cannot renegotiate: no signaling transport available")
             return
         }
 
@@ -546,10 +806,13 @@ class WebRtcViewportManager(
                 Log.i(TAG, "Renegotiation offer created successfully")
                 peer.setLocalDescription(KinesisVideoSdpObserver(), sessionDescription)
 
-                if (client?.isOpen == true) {
+                if (localClient != null) {
+                    localClient?.sendSdpOffer(sessionDescription.description)
+                    Log.i(TAG, "Renegotiation offer sent via local signaling")
+                } else if (client?.isOpen == true) {
                     val message = Message.createOfferMessage(sessionDescription, mClientId ?: "")
                     client?.sendSdpOffer(message)
-                    Log.i(TAG, "Renegotiation offer sent to peer")
+                    Log.i(TAG, "Renegotiation offer sent via KVS")
                 }
             }
 
@@ -572,7 +835,16 @@ class WebRtcViewportManager(
         isMaster: Boolean = false,
         clientId: String? = null
     ) {
-        if (rootEglBase != null || isStarting) {
+        synchronized(stateLock) {
+            if (!canStart()) {
+                Log.w(TAG, "start() called in state $state; ignoring")
+                return
+            }
+            state = ManagerState.STARTING
+            deferredStopRequested = false
+            Log.d(TAG, "state: -> STARTING (start)")
+        }
+        if (rootEglBase != null) {
             Log.w(TAG, "WebRTC already started")
             return
         }
@@ -581,6 +853,8 @@ class WebRtcViewportManager(
         // pass the guard and double-init (EglBase/factory/renderer.init twice).
         isStarting = true
 
+        ensureExecutorsAlive()
+
         this.mChannelArn = channelArn
         this.mStreamArn = streamArn
         this.mWssEndpoint = wssEndpoint
@@ -588,6 +862,11 @@ class WebRtcViewportManager(
         this.mRegion = region
         this.master = isMaster
         this.remoteView = surfaceViewRenderer
+        lastStartParams = CachedStartParams.Kvs(
+            channelArn, streamArn, wssEndpoint, webrtcEndpoint, region,
+            iceServers, dataEndpoint, surfaceViewRenderer, isMaster, clientId
+        )
+        attachRenderer(surfaceViewRenderer)
 
         // Use provided client ID or generate new one
         mClientId = clientId ?: UUID.randomUUID().toString()
@@ -600,49 +879,13 @@ class WebRtcViewportManager(
 
         // Run heavy initialization on a background thread to avoid blocking the UI
         Thread {
-            rootEglBase = EglBase.create()
+            initWebRtcInfrastructure()
 
             // Add STUN server
             val stun = IceServer.builder(
                 String.format("stun:stun.kinesisvideo.%s.amazonaws.com:443", region)
             ).createIceServer()
             peerIceServers.add(stun)
-
-            // Initialize PeerConnectionFactory if not already pre-initialized
-            ensureFactoryInitialized(context)
-
-            val vdf = LowLatencyDefaultVideoDecoderFactory(rootEglBase!!.eglBaseContext)
-            val vef = BaselineDefaultVideoEncoderFactory(
-                rootEglBase!!.eglBaseContext,
-                ENABLE_INTEL_VP8_ENCODER,
-                ENABLE_H264_HIGH_PROFILE
-            )
-
-            val audioDeviceModule = JavaAudioDeviceModule.builder(context.applicationContext)
-                .setAudioAttributes(android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build())
-                .createAudioDeviceModule()
-
-            peerConnectionFactory = PeerConnectionFactory.builder()
-                .setVideoDecoderFactory(vdf)
-                .setVideoEncoderFactory(vef)
-                .setAudioDeviceModule(audioDeviceModule)
-                .createPeerConnectionFactory()
-
-            // Enable WebRTC debug logs
-            Logging.enableLogToDebugOutput(Logging.Severity.LS_INFO)
-
-            // Initialize SurfaceViewRenderer on main thread (required for view operations)
-            val viewInitLatch = java.util.concurrent.CountDownLatch(1)
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                remoteView?.init(rootEglBase!!.eglBaseContext, null)
-                remoteView?.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-                remoteView?.setMirror(false)
-                viewInitLatch.countDown()
-            }
-            viewInitLatch.await()
 
             // Continue with connection setup (already on background thread)
             if (iceServers.isNotEmpty()) {
@@ -707,6 +950,144 @@ class WebRtcViewportManager(
         }.start()
     }
 
+    /**
+     * Start a WebRTC session using local network signaling instead of KVS WebSocket.
+     * SDP/ICE exchange happens over the device's HTTP local control transport using protobuf.
+     * No STUN/TURN servers are used — LAN-only ICE candidates.
+     */
+    fun startLocal(
+        localDevice: EspLocalDevice,
+        surfaceViewRenderer: SurfaceViewRenderer,
+        clientId: String? = null
+    ) {
+        synchronized(stateLock) {
+            if (!canStart()) {
+                Log.w(TAG, "startLocal() called in state $state; ignoring")
+                return
+            }
+            state = ManagerState.STARTING
+            deferredStopRequested = false
+            Log.d(TAG, "state: -> STARTING (startLocal)")
+        }
+        if (rootEglBase != null) {
+            Log.w(TAG, "WebRTC already started")
+            return
+        }
+
+        ensureExecutorsAlive()
+
+        this.remoteView = surfaceViewRenderer
+        lastStartParams = CachedStartParams.Local(localDevice, surfaceViewRenderer, clientId)
+        attachRenderer(surfaceViewRenderer)
+        mClientId = clientId ?: "local-app-${UUID.randomUUID().toString().substring(0, 8)}"
+
+        // Initialize audio manager
+        audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        Thread {
+            initWebRtcInfrastructure()
+
+            // No STUN/TURN for LAN-only signaling — peerIceServers stays empty
+
+            // Create peer connection (no ICE servers for LAN)
+            createLocalPeerConnection()
+            if (WebRtcConstants.SEND_AUDIO_BY_DEFAULT) addLocalAudioTrack()
+
+            // Create local signaling client
+            localClient = LocalSignalingClient(
+                localDevice = localDevice,
+                peerId = mClientId!!,
+                onSdpAnswer = { sdp ->
+                    Log.d(TAG, "Local signaling: SDP answer received")
+                    sdpAnswerReceived = true
+                    offerRetryHandler.removeCallbacksAndMessages(null)
+                    val sdpAnswer = SessionDescription(SessionDescription.Type.ANSWER, sdp)
+                    localPeer?.setRemoteDescription(
+                        object : KinesisVideoSdpObserver() {
+                            override fun onCreateFailure(error: String) {
+                                super.onCreateFailure(error)
+                                Log.e(TAG, "Failed to set remote description: $error")
+                            }
+                        },
+                        sdpAnswer
+                    )
+                    // Handle any pending ICE candidates
+                    handlePendingIceCandidates(mClientId!!)
+                },
+                onIceCandidate = { candidateJson ->
+                    Log.d(TAG, "Local signaling: ICE candidate received")
+                    val candidate = LocalSignalingClient.parseIceCandidateJson(candidateJson)
+                    if (candidate != null) {
+                        localPeer?.addIceCandidate(candidate)
+                    } else {
+                        Log.e(TAG, "Failed to parse ICE candidate from local signaling")
+                    }
+                },
+                onError = { error ->
+                    Log.e(TAG, "Local signaling error: $error")
+                    onError?.invoke(error)
+                }
+            )
+
+            // Create and send SDP offer
+            if (localPeer != null) {
+                createSdpOffer()
+            } else {
+                onError?.invoke("Peer connection not initialized")
+            }
+        }.start()
+    }
+
+    /**
+     * Initialize EGL, PeerConnectionFactory, and SurfaceViewRenderer.
+     * Shared between [start] (KVS) and [startLocal] (local signaling).
+     * Must be called on a background thread.
+     */
+    private fun initWebRtcInfrastructure() {
+        rootEglBase = EglBase.create()
+
+        ensureFactoryInitialized(context)
+
+        val vdf = LowLatencyDefaultVideoDecoderFactory(rootEglBase!!.eglBaseContext)
+        val vef = BaselineDefaultVideoEncoderFactory(
+            rootEglBase!!.eglBaseContext,
+            ENABLE_INTEL_VP8_ENCODER,
+            ENABLE_H264_HIGH_PROFILE
+        )
+
+        val adm = JavaAudioDeviceModule.builder(context.applicationContext)
+            .setAudioAttributes(android.media.AudioAttributes.Builder()
+                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build())
+            .createAudioDeviceModule()
+        audioDeviceModule = adm
+
+        peerConnectionFactory = PeerConnectionFactory.builder()
+            .setVideoDecoderFactory(vdf)
+            .setVideoEncoderFactory(vef)
+            .setAudioDeviceModule(adm)
+            .createPeerConnectionFactory()
+
+        Logging.enableLogToDebugOutput(Logging.Severity.LS_INFO)
+
+        // Kick off SurfaceViewRenderer init on main thread (required for view ops)
+        // but DON'T block — peer connection + offer creation proceed in parallel.
+        // The renderer init is posted to the main thread handler first, and the
+        // video sink attachment (addRemoteStreamToVideoView) is also posted to the
+        // main thread later — FIFO ordering guarantees the renderer is ready.
+        Handler(Looper.getMainLooper()).post {
+            try {
+                remoteView?.release()
+                remoteView?.init(rootEglBase!!.eglBaseContext, null)
+                remoteView?.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                remoteView?.setMirror(false)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error initializing SurfaceViewRenderer: ${e.message}")
+            }
+        }
+    }
+
     private fun createLocalPeerConnection() {
         val rtcConfig = PeerConnection.RTCConfiguration(peerIceServers)
 
@@ -727,9 +1108,14 @@ class WebRtcViewportManager(
         localPeer = peerConnectionFactory?.createPeerConnection(rtcConfig, object : KinesisVideoPeerConnection() {
             override fun onIceCandidate(iceCandidate: IceCandidate) {
                 super.onIceCandidate(iceCandidate)
-                val message = createIceCandidateMessage(iceCandidate)
-                Log.d(TAG, "Sending IceCandidate to remote peer $iceCandidate")
-                client?.sendIceCandidate(message)
+                if (localClient != null) {
+                    Log.d(TAG, "Sending IceCandidate via local signaling")
+                    localClient?.sendIceCandidate(iceCandidate)
+                } else {
+                    val message = createIceCandidateMessage(iceCandidate)
+                    Log.d(TAG, "Sending IceCandidate to remote peer $iceCandidate")
+                    client?.sendIceCandidate(message)
+                }
             }
 
             override fun onAddStream(mediaStream: MediaStream) {
@@ -758,9 +1144,9 @@ class WebRtcViewportManager(
             override fun onIceConnectionChange(iceConnectionState: PeerConnection.IceConnectionState) {
                 super.onIceConnectionChange(iceConnectionState)
 
-                // Check if we're already stopping - don't process callbacks
-                if (isStopping) {
-                    Log.d(TAG, "Ignoring ICE connection change - already stopping")
+                // Don't process callbacks if we're already tearing down
+                if (state == ManagerState.STOPPING || state == ManagerState.STOPPED) {
+                    Log.d(TAG, "Ignoring ICE connection change - state=$state")
                     return
                 }
 
@@ -772,35 +1158,35 @@ class WebRtcViewportManager(
                         // leaves the "playing" screen. Run on a fresh thread, not inline: this
                         // callback is on the libwebrtc signaling thread, and disposing the peer
                         // here lets a queued event lock a freed mutex → SIGABRT.
-                        if (!isStopping) {
-                            Thread({ stop() }, "ice-failed-stop").start()
-                        }
+                        // (state guard already checked above at method entry.)
+                        Thread({ stop() }, "ice-failed-stop").start()
                     }
                     PeerConnection.IceConnectionState.DISCONNECTED -> {
                         Log.w(TAG, "ICE connection disconnected - connection may recover, not tearing down")
-                        // Do NOT call stop() - ICE DISCONNECTED is often transient on mobile networks
-                        // Just notify the UI so it can show a status indicator if desired
-                        if (!isStopping) {
-                            try {
-                                onConnectionStateChanged?.invoke(false)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error invoking connection state callback: ${e.message}", e)
-                            }
-                        }
+                        // DISCONNECTED is often transient (mobile NAT timeout, brief link
+                        // glitch, RTT spike). On real hardware we observe ICE going
+                        // DISCONNECTED → CONNECTED again in 300-500 ms — well below the
+                        // FAILED timeout. Don't notify the UI as "failed" here; the
+                        // user's app shows "peer failed" even though the peer is fine.
+                        // Only ICE FAILED below is terminal and gets the false callback
+                        // (via the stop() path that fires onConnectionStateChanged(false)
+                        // on actual disconnect).
                     }
                     PeerConnection.IceConnectionState.CONNECTED -> {
-                        if (!isStreamActive && !isStopping) {
+                        if (!isStreamActive && state != ManagerState.STOPPING && state != ManagerState.STOPPED) {
                             streamStartTime = System.currentTimeMillis()
                             isStreamActive = true
                             Log.i(TAG, "Stream started - duration tracking began")
                             startStatsCollection()
+                            // Peer connected — nothing left to poll for.
+                            localClient?.stopPolling()
                         }
                         if (pendingRenegotiation) {
                             pendingRenegotiation = false
                             Log.i(TAG, "Flushing deferred renegotiation after CONNECTED")
                             renegotiate()
                         }
-                        if (!isStopping) {
+                        if (state != ManagerState.STOPPING && state != ManagerState.STOPPED) {
                             try {
                                 onConnectionStateChanged?.invoke(true)
                             } catch (e: Exception) {
@@ -812,6 +1198,10 @@ class WebRtcViewportManager(
                 }
             }
         })
+        // Peer connection initialized — STARTING -> RUNNING (or honor deferred stop)
+        if (localPeer != null) {
+            transitionToRunningIfStarting()
+        }
     }
 
     /**
@@ -1042,15 +1432,21 @@ class WebRtcViewportManager(
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
                 super.onCreateSuccess(sessionDescription)
                 localPeer?.setLocalDescription(object : KinesisVideoSdpObserver() {}, sessionDescription)
-                val message = Message.createOfferMessage(sessionDescription, mClientId ?: "")
 
-                if (client?.isOpen == true) {
-                    client?.sendSdpOffer(message)
-                    Log.d(TAG, "SDP Offer created and sent")
-                    scheduleOfferRetry()
+                if (localClient != null) {
+                    Log.d(TAG, "SDP Offer created, sending via local signaling")
+                    localClient?.sendSdpOffer(sessionDescription.description)
+                    // No scheduleOfferRetry() — LocalSignalingClient has its own answer timeout
                 } else {
-                    Log.e(TAG, "Cannot send SDP offer: WebSocket connection is not open")
-                    onError?.invoke("WebSocket connection lost")
+                    val message = Message.createOfferMessage(sessionDescription, mClientId ?: "")
+                    if (client?.isOpen == true) {
+                        client?.sendSdpOffer(message)
+                        Log.d(TAG, "SDP Offer created and sent")
+                        scheduleOfferRetry()
+                    } else {
+                        Log.e(TAG, "Cannot send SDP offer: WebSocket connection is not open")
+                        onError?.invoke("WebSocket connection lost")
+                    }
                 }
             }
 
@@ -1111,7 +1507,7 @@ class WebRtcViewportManager(
                 return
             }
 
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
+            Handler(Looper.getMainLooper()).post {
                 try {
                     // Double-check view is still valid
                     val currentView = remoteView
@@ -1120,8 +1516,31 @@ class WebRtcViewportManager(
                         return@post
                     }
 
+                    // Defensive init: the createLocalPeerConnection path queues
+                    // remoteView.init() on the main thread, and onAddStream may
+                    // queue this addSink BEFORE that init has executed. If we
+                    // addSink to a not-yet-init'd renderer, EglRenderer's frame
+                    // pump runs (Frames received counts) but renderFrameOnRender
+                    // Thread drops every frame because eglBase has no Surface
+                    // ⇒ FPS overlay shows but viewport stays black. init() is
+                    // idempotent if we catch IllegalStateException from "already
+                    // initialized".
+                    val egl = rootEglBase
+                    if (egl != null) {
+                        try {
+                            currentView.init(egl.eglBaseContext, null)
+                            Log.d(TAG, "Defensive init of remoteView before addSink")
+                        } catch (e: IllegalStateException) {
+                            // Already initialized — that's the expected path
+                        }
+                    } else {
+                        Log.w(TAG, "rootEglBase is null at addSink time; renderer cannot bind EGL")
+                    }
+
                     Log.d(TAG, "remoteVideoTrackId=${videoTrack.id()} videoTrackState=${videoTrack.state()}")
                     videoTrack.addSink(currentView)
+                    // Independent count-only sink for the surface watchdog (decode side).
+                    try { videoTrack.addSink(countingReceiveSink) } catch (_: Exception) {}
                     onConnectionStateChanged?.invoke(true)
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in setting remote video view: $e", e)
@@ -1199,24 +1618,120 @@ class WebRtcViewportManager(
         }
     }
 
-    @Volatile
-    private var isStopping = false
+    /**
+     * Called from the async setup path after createLocalPeerConnection() has run.
+     * Moves STARTING -> RUNNING, or honors a deferred-stop request that arrived
+     * while we were still in STARTING.
+     */
+    private fun transitionToRunningIfStarting() {
+        val wantStop: Boolean
+        val wantWatchdog: Boolean
+        synchronized(stateLock) {
+            if (state != ManagerState.STARTING) return
+            if (deferredStopRequested) {
+                deferredStopRequested = false
+                wantStop = true
+                wantWatchdog = false
+            } else {
+                state = ManagerState.RUNNING
+                wantStop = false
+                wantWatchdog = true
+                Log.d(TAG, "state: STARTING -> RUNNING")
+            }
+        }
+        if (wantWatchdog) {
+            // Successful transition to RUNNING — any prior restart-in-flight is resolved.
+            restartInFlight = false
+            startSurfaceWatchdog()
+        }
+        if (wantStop) {
+            Log.d(TAG, "Deferred stop honored after STARTING")
+            // run stop on a fresh thread so we don't recurse on the signaling thread
+            Thread { stop() }.start()
+        }
+    }
 
     fun stop() {
-        // Prevent multiple simultaneous stop calls
-        if (isStopping) {
-            Log.w(TAG, "Stop already in progress, ignoring duplicate call")
-            return
-        }
-
-        synchronized(this) {
-            if (isStopping) {
-                return
+        val transitionedToStopping: Boolean
+        synchronized(stateLock) {
+            when (state) {
+                ManagerState.IDLE -> {
+                    Log.d(TAG, "stop() called in IDLE; no-op")
+                    return
+                }
+                ManagerState.STOPPED -> {
+                    Log.d(TAG, "stop() called in STOPPED; no-op")
+                    return
+                }
+                ManagerState.STOPPING -> {
+                    Log.w(TAG, "stop() already in progress; ignoring duplicate call")
+                    return
+                }
+                ManagerState.STARTING -> {
+                    Log.d(TAG, "stop() during STARTING; deferring until peer init returns")
+                    deferredStopRequested = true
+                    return
+                }
+                ManagerState.RUNNING -> {
+                    state = ManagerState.STOPPING
+                    transitionedToStopping = true
+                    Log.d(TAG, "state: RUNNING -> STOPPING")
+                }
             }
-            isStopping = true
+        }
+        if (!transitionedToStopping) return
+
+        try {
+            performStopCleanup()
+        } finally {
+            synchronized(stateLock) {
+                state = ManagerState.STOPPED
+            }
+            Log.d(TAG, "state: STOPPING -> STOPPED")
+            // Fire onTerminallyStopped iff this stop is terminal — either an explicit
+            // user-initiated stop or no replacement is in flight. Reset userInitiatedStop
+            // so a follow-on stop() does not inherit the flag.
+            val wasUserInitiated = userInitiatedStop
+            val fireTerminal = userInitiatedStop || !restartInFlight
+            val callback = onTerminallyStopped
+            userInitiatedStop = false
+            if (fireTerminal && callback != null) {
+                try {
+                    Log.d(TAG, "Firing onTerminallyStopped (userInitiated=$wasUserInitiated, restartInFlight=$restartInFlight)")
+                    callback.invoke()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error invoking onTerminallyStopped: ${e.message}", e)
+                }
+            } else {
+                Log.d(TAG, "Suppressing onTerminallyStopped (restartInFlight=$restartInFlight)")
+            }
+        }
+    }
+
+    private fun performStopCleanup() {
+        Log.d(TAG, "Stopping WebRTC connection")
+
+        // Stop surface watchdog
+        stopSurfaceWatchdog()
+
+        // Cancel any pending idle-stop and clear renderer set
+        idleStopHandler.removeCallbacks(idleStopRunnable)
+        synchronized(attachLock) {
+            // Remove FrameListeners and clear back-references before dropping the set
+            attachedRenderers.forEach { r ->
+                frameListenerByRenderer.remove(r)?.let { listener ->
+                    try { r.removeFrameListener(listener) } catch (_: Exception) {}
+                }
+                if (r is FlippableSurfaceViewRenderer && r.attachedManager === this) {
+                    r.attachedManager = null
+                }
+            }
+            attachedRenderers.clear()
+            renderedFrameCounterByRenderer.clear()
         }
 
-        Log.d(TAG, "Stopping WebRTC connection")
+        // Detach the count-only watchdog sink from the remote video track if still attached
+        try { remoteVideoTrack?.removeSink(countingReceiveSink) } catch (_: Exception) {}
 
         // Stop stats collection before anything else
         stopStatsCollection()
@@ -1238,6 +1753,10 @@ class WebRtcViewportManager(
         offerRetryHandler.removeCallbacksAndMessages(null)
         sdpAnswerReceived = false
         offerAttempt = 0
+
+        // Clean up local signaling client
+        localClient?.disconnect()
+        localClient = null
 
         // Store callback references and clear them immediately to prevent callbacks during cleanup
         val connectionCallback = onConnectionStateChanged
@@ -1280,8 +1799,8 @@ class WebRtcViewportManager(
         // Remove video track sink before disposing (must be on main thread)
         videoTrack?.let { track ->
             if (view != null) {
-                val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                val handler = Handler(Looper.getMainLooper())
+                if (Looper.myLooper() == Looper.getMainLooper()) {
                     // Already on main thread, execute directly
                     try {
                         track.removeSink(view)
@@ -1304,11 +1823,14 @@ class WebRtcViewportManager(
                             latch.countDown()
                         }
                     }
-                    // Wait up to 1 second for sink removal
+                    // Wait up to 1 second for sink removal. If interrupted, restore the
+                    // flag for downstream code but CONTINUE through the rest of stop() —
+                    // bailing here leaves the ADM and factory alive and the mic hot.
                     try {
                         latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
                     } catch (e: InterruptedException) {
-                        Log.e(TAG, "Interrupted while waiting for sink removal", e)
+                        Log.w(TAG, "Interrupted waiting for sink removal; continuing cleanup", e)
+                        Thread.currentThread().interrupt()
                     }
                 }
             }
@@ -1348,7 +1870,32 @@ class WebRtcViewportManager(
         }
         rootEglBase = null
 
-        // Do not dispose PeerConnectionFactory; re-create on next start only
+        // Drain executors that may still submit JNI work touching the factory. Without
+        // this drain, a signaling thread can submit to mediaOpsExecutor after dispose()
+        // and JNI lands on a freed factory (SIGABRT in signaling_thread). Same risk for
+        // statsExecutor calling peer.getStats() against a half-disposed graph.
+        drainExecutor(mediaOpsExecutor, MEDIA_OPS_THREAD_NAME)
+        drainExecutor(statsExecutor, STATS_THREAD_NAME)
+
+        // Release the Java-side AudioDeviceModule explicitly. PeerConnectionFactory.dispose()
+        // only drops its reference; the ADM's native capture/playback threads keep running
+        // otherwise and the mic stays hot.
+        try {
+            audioDeviceModule?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing AudioDeviceModule: $e", e)
+        }
+        audioDeviceModule = null
+
+        // Dispose PeerConnectionFactory so its native AudioDeviceModule stops capturing
+        // and playing audio. Previously we left it alive to speed up restart, but that
+        // leaked audio activity into the background; restartIfStopped() now handles the
+        // re-creation cost (hundreds of ms).
+        try {
+            peerConnectionFactory?.dispose()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error disposing PeerConnectionFactory: $e", e)
+        }
         peerConnectionFactory = null
 
         // Reset audio manager
@@ -1359,9 +1906,6 @@ class WebRtcViewportManager(
         }
         audioManager = null
 
-        // Shutdown stats executor
-        statsExecutor.shutdownNow()
-
         // Clear maps
         peerConnectionFoundMap.clear()
         pendingIceCandidatesMap.clear()
@@ -1370,7 +1914,7 @@ class WebRtcViewportManager(
         // Invoke callback on main thread if available (callbacks already cleared above, use stored reference)
         try {
             connectionCallback?.let { callback ->
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                Handler(Looper.getMainLooper()).post {
                     try {
                         callback(false)
                     } catch (e: Exception) {
@@ -1382,13 +1926,124 @@ class WebRtcViewportManager(
             Log.e(TAG, "Error posting connection state callback: ${e.message}", e)
         }
 
-        isStarting = false
-        isStopping = false
         Log.d(TAG, "WebRTC connection stopped")
     }
 
     fun isActive(): Boolean {
-        return rootEglBase != null && client?.isOpen == true
+        return rootEglBase != null && (client?.isOpen == true || localClient?.isOpen() == true)
+    }
+
+    private fun ensureExecutorsAlive() {
+        if (mediaOpsExecutor.isShutdown) {
+            mediaOpsExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, MEDIA_OPS_THREAD_NAME) }
+        }
+        if (statsExecutor.isShutdown) {
+            statsExecutor = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, STATS_THREAD_NAME) }
+        }
+    }
+
+    private fun drainExecutor(executor: java.util.concurrent.ExecutorService, name: String) {
+        // Self-drain guard: if we're already running on the executor's worker thread,
+        // awaitTermination can never succeed (the thread can't terminate while it's
+        // running this code). Skip the wait and just shutdownNow — the current task
+        // returns naturally and no new work will be accepted.
+        if (Thread.currentThread().name == name) {
+            Log.w(TAG, "drainExecutor: called from $name thread; skipping awaitTermination")
+            try { executor.shutdownNow() } catch (_: Exception) {}
+            return
+        }
+        try {
+            executor.shutdown()
+            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                Log.w(TAG, "$name did not terminate within 2s, forcing shutdownNow")
+                executor.shutdownNow()
+            }
+        } catch (e: InterruptedException) {
+            Log.w(TAG, "Interrupted draining $name; forcing shutdownNow")
+            executor.shutdownNow()
+            Thread.currentThread().interrupt()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error draining $name: ${e.message}", e)
+            try { executor.shutdownNow() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * If this session has been stopped (e.g. by the process-level ON_STOP observer)
+     * and we have cached start parameters, release the cached renderer and replay
+     * the original start() / startLocal() call. Intended to be called from an
+     * ON_RESUME observer in the UI that owns the manager. Returns true if a
+     * restart was attempted, false if the session is still active or no cached
+     * params exist.
+     */
+    /**
+     * Explicit user-initiated stop. Always fires onTerminallyStopped regardless of
+     * any in-flight restart flag — i.e. "the user pressed Stop, the UI should idle".
+     */
+    fun userStop() {
+        userInitiatedStop = true
+        Log.d(TAG, "userStop(): user-initiated stop requested")
+        stop()
+    }
+
+    /**
+     * Mark a fallback / retry as in-flight on this manager. Set BEFORE calling stop()
+     * when a replacement session is about to start. Cleared automatically on
+     * successful transition to RUNNING; callers may also clear explicitly.
+     */
+    fun markRestartInFlight() {
+        restartInFlight = true
+        Log.d(TAG, "Restart-in-flight flag set; next stop() will not fire onTerminallyStopped")
+    }
+
+    fun clearRestartInFlight() {
+        restartInFlight = false
+    }
+
+    fun restartIfStopped(): Boolean {
+        synchronized(stateLock) {
+            if (!canRestart()) {
+                Log.d(TAG, "restartIfStopped: state=$state, not STOPPED — refusing")
+                return false
+            }
+        }
+        val params = lastStartParams ?: return false
+        Log.d(TAG, "restartIfStopped: replaying last start params")
+        return try {
+            when (params) {
+                is CachedStartParams.Kvs -> {
+                    try { params.surfaceViewRenderer.release() } catch (e: Exception) {
+                        Log.w(TAG, "Renderer release before restart failed: ${e.message}")
+                    }
+                    start(
+                        channelArn = params.channelArn,
+                        streamArn = params.streamArn,
+                        wssEndpoint = params.wssEndpoint,
+                        webrtcEndpoint = params.webrtcEndpoint,
+                        region = params.region,
+                        iceServers = params.iceServers,
+                        dataEndpoint = params.dataEndpoint,
+                        surfaceViewRenderer = params.surfaceViewRenderer,
+                        isMaster = params.isMaster,
+                        clientId = params.clientId
+                    )
+                }
+                is CachedStartParams.Local -> {
+                    try { params.surfaceViewRenderer.release() } catch (e: Exception) {
+                        Log.w(TAG, "Renderer release before restart failed: ${e.message}")
+                    }
+                    startLocal(
+                        localDevice = params.localDevice,
+                        surfaceViewRenderer = params.surfaceViewRenderer,
+                        clientId = params.clientId
+                    )
+                }
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "restartIfStopped failed: ${e.message}", e)
+            false
+        }
     }
 
     /**
@@ -1440,7 +2095,9 @@ class WebRtcViewportManager(
     }
 
     // --- Stats collection ---
-    private val statsExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    // Recreated by start()/startLocal() if previously drained by stop().
+    private var statsExecutor: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, STATS_THREAD_NAME) }
     private var statsTask: ScheduledFuture<*>? = null
     @Volatile private var shouldCollectStats = false
 
@@ -1565,6 +2222,82 @@ class WebRtcViewportManager(
     private var originalViewportRenderer: SurfaceViewRenderer? = null
 
     /**
+     * Register a SurfaceViewRenderer as an active UI consumer of this session.
+     * Cancels any pending idle-stop. Safe to call multiple times for the same renderer.
+     */
+    /**
+     * Direct frame-render notification from FlippableSurfaceViewRenderer.onFrame.
+     * Bypasses EglRenderer.addFrameListener which doesn't fire on this WebRTC build.
+     * Bumps the renderer's per-renderer rendered-frame counter used by the surface
+     * watchdog to detect a stuck render path.
+     */
+    fun notifyRendered(renderer: SurfaceViewRenderer) {
+        renderedFrameCounterByRenderer[renderer]?.incrementAndGet()
+    }
+
+        fun attachRenderer(renderer: SurfaceViewRenderer) {
+        synchronized(attachLock) {
+            if (attachedRenderers.add(renderer)) {
+                // Set stable back-reference so the renderer's surfaceDestroyed can
+                // detach without depending on a Compose-captured manager.
+                if (renderer is FlippableSurfaceViewRenderer) {
+                    renderer.attachedManager = this
+                }
+                // Per-renderer rendered-frame counter via EglRenderer.FrameListener
+                renderedFrameCounterByRenderer.putIfAbsent(
+                    renderer, AtomicLong(0L)
+                )
+                val listener = FrameListener {
+                    renderedFrameCounterByRenderer[renderer]?.incrementAndGet()
+                }
+                frameListenerByRenderer[renderer] = listener
+                try {
+                    renderer.addFrameListener(listener, 1.0f)
+                } catch (e: Exception) {
+                    Log.w(TAG, "addFrameListener failed for renderer ${renderer.hashCode()}: ${e.message}")
+                }
+                Log.d(TAG, "attachRenderer: count=${attachedRenderers.size}")
+            }
+        }
+        idleStopHandler.removeCallbacks(idleStopRunnable)
+        // New attach = fresh UI engagement; give the watchdog a clean budget.
+        watchdogBadTicks.set(0)
+    }
+
+    /**
+     * Deregister a SurfaceViewRenderer. When no renderers remain attached,
+     * schedule a delayed stop so brief transitions don't tear the session down.
+     */
+    fun detachRenderer(renderer: SurfaceViewRenderer) {
+        val isEmpty = synchronized(attachLock) {
+            val removed = attachedRenderers.remove(renderer)
+            if (removed) {
+                // Remove the per-renderer FrameListener and counter
+                frameListenerByRenderer.remove(renderer)?.let { listener ->
+                    try { renderer.removeFrameListener(listener) } catch (_: Exception) {}
+                }
+                renderedFrameCounterByRenderer.remove(renderer)
+                // Clear back-reference only if this manager still owns it
+                if (renderer is FlippableSurfaceViewRenderer && renderer.attachedManager === this) {
+                    renderer.attachedManager = null
+                }
+                Log.d(TAG, "detachRenderer: count=${attachedRenderers.size}")
+            }
+            attachedRenderers.isEmpty()
+        }
+        if (isEmpty) {
+            val curState = state
+            if (curState == ManagerState.RUNNING) {
+                idleStopHandler.removeCallbacks(idleStopRunnable)
+                idleStopHandler.postDelayed(idleStopRunnable, IDLE_STOP_DELAY_MS)
+                Log.d(TAG, "No renderers attached; scheduled stop in ${IDLE_STOP_DELAY_MS}ms")
+            } else {
+                Log.d(TAG, "No renderers attached but state=$curState — NOT scheduling idle stop (only valid from RUNNING)")
+            }
+        }
+    }
+
+    /**
      * Transfer video rendering to a new SurfaceViewRenderer
      * This allows moving the video from viewport to fullscreen without reconnecting
      */
@@ -1595,10 +2328,10 @@ class WebRtcViewportManager(
             Log.d(TAG, "Transfer: oldView=${oldView != null} (originalViewportRenderer=${originalViewportRenderer != null}, remoteView=${remoteView != null}), newRenderer=${newRenderer != null}")
 
             // Ensure we're on main thread
-            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
                 transferVideoTrackInternal(videoTrack, oldView, newRenderer)
             } else {
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                Handler(Looper.getMainLooper()).post {
                     try {
                         transferVideoTrackInternal(videoTrack, oldView, newRenderer)
                     } catch (e: Exception) {
@@ -1663,6 +2396,7 @@ class WebRtcViewportManager(
                 Log.d(TAG, "Adding video sink to new renderer (newRenderer=${newRenderer.hashCode()})...")
                 val previousRemoteView = remoteView
                 videoTrack.addSink(newRenderer)
+                attachRenderer(newRenderer)
                 Log.d(TAG, "Video sink added to new renderer")
 
                 // Now remove old sinks (new sink is already receiving frames)
@@ -1670,6 +2404,7 @@ class WebRtcViewportManager(
                 if (oldView != null && oldView != newRenderer) {
                     try {
                         videoTrack.removeSink(oldView)
+                        detachRenderer(oldView)
                         Log.d(TAG, "Removed old sink (oldView=${oldView.hashCode()})")
                     } catch (e: Exception) {
                         Log.w(TAG, "Note removing sink from old view: ${e.message}")
@@ -1679,6 +2414,7 @@ class WebRtcViewportManager(
                 if (previousRemoteView != null && previousRemoteView != oldView && previousRemoteView != newRenderer) {
                     try {
                         videoTrack.removeSink(previousRemoteView)
+                        detachRenderer(previousRemoteView)
                         Log.d(TAG, "Removed sink from previous remoteView (${previousRemoteView.hashCode()})")
                     } catch (e: Exception) {
                         Log.w(TAG, "Note removing sink from previous remoteView: ${e.message}")

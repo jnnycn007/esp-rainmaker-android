@@ -224,7 +224,8 @@ fun WebRtcVideoPlayer(
     onSurfaceViewRendererChange: (SurfaceViewRenderer?) -> Unit,
     modifier: Modifier = Modifier,
     showOrientationToggle: Boolean = true,
-    videoSessionKey: Int = 0
+    videoSessionKey: Int = 0,
+    onSessionKeyIncrement: () -> Unit = {}
 ) {
     var showControls by remember { mutableStateOf(false) }
     var showStatsDialog by remember { mutableStateOf(false) }
@@ -274,7 +275,16 @@ fun WebRtcVideoPlayer(
                     }
                 },
                 update = { view ->
-                    view.visibility = if (isPlaying) android.view.View.VISIBLE else android.view.View.GONE
+                    view.visibility = android.view.View.VISIBLE  // always-VISIBLE: keep Surface alive end-to-end; Play overlay sits on top
+                    // No more detach on surfaceDestroyed — surface flaps during BG/FG
+                    // transitions don't kill the session. AndroidView.onRelease (below)
+                    // is the source of truth for "view actually disposed".
+                    view.onSurfaceDestroyed = null
+                },
+                onRelease = { view ->
+                    // Fires when this AndroidView leaves the composition while its
+                    // parent Composable stays alive (Crossfade, tab switch, key change).
+                    webRtcManager?.detachRenderer(view)
                 },
                 modifier = Modifier
                     .fillMaxSize()
@@ -378,7 +388,16 @@ fun WebRtcVideoPlayer(
                     modifier = Modifier
                         .align(Alignment.Center)
                         .size(56.dp),
-                    onClick = onVideoStop
+                    onClick = {
+                        // STATE CONTRACT: explicit user-Stop must mark the stop as user-initiated
+                        // so onTerminallyStopped fires regardless of any restart-in-flight flag.
+                        webRtcManager?.userStop()
+                        onVideoStop()
+                        // Fresh-renderer reset is now ONLY on explicit user-Stop; retries reuse
+                        // the live SurfaceView so frames render immediately on reconnect.
+                        onSurfaceViewRendererChange(null)
+                        onSessionKeyIncrement()
+                    }
                 ) {
                     Box(
                         modifier = Modifier
@@ -597,7 +616,13 @@ fun LandscapeControlsOverlay(
                         modifier = Modifier
                             .align(Alignment.Center)
                             .size(56.dp),
-                        onClick = onStop
+                        onClick = {
+                            // STATE CONTRACT: explicit user-Stop must mark the stop as
+                            // user-initiated so onTerminallyStopped fires regardless of any
+                            // restart-in-flight flag.
+                            manager?.userStop()
+                            onStop()
+                        }
                     ) {
                         Box(
                             modifier = Modifier
@@ -914,6 +939,18 @@ fun initCameraControls(view: View, nodeId: String, hasControlParam: Boolean = tr
                 }
             }
 
+            // The ONLY signal that flips isPlaying back to false. Per the manager's STATE
+            // CONTRACT, intermediate stops inside retry/fallback chains don't fire this;
+            // only terminal stops (user action, exhausted retries, dead surface) do.
+            DisposableEffect(webRtcManager) {
+                webRtcManager?.onTerminallyStopped = {
+                    Log.d("CameraControls", "onTerminallyStopped — flipping isPlaying=false")
+                    isPlaying = false
+                    isLoading = false
+                }
+                onDispose { webRtcManager?.onTerminallyStopped = null }
+            }
+
             val channelName = "esp-v1-$nodeId"
 
             val onVideoPlay: () -> Unit = {
@@ -932,8 +969,12 @@ fun initCameraControls(view: View, nodeId: String, hasControlParam: Boolean = tr
                     }
                     Toast.makeText(context, context.getString(R.string.camera_toast_permissions_required), Toast.LENGTH_SHORT).show()
                 } else {
-                    // Check if region is available (credentials fetched)
-                    if (EspApplication.region.isNullOrEmpty()) {
+                    // Skip credential check for local signaling — KVS credentials
+                    // are only needed for the cloud path.
+                    val espApp = context.applicationContext as EspApplication
+                    val isLocalDevice = espApp.localDeviceMap.containsKey(nodeId)
+
+                    if (!isLocalDevice && EspApplication.region.isNullOrEmpty()) {
                         Handler(Looper.getMainLooper()).post {
                             Toast.makeText(context, context.getString(R.string.camera_toast_fetching_credentials), Toast.LENGTH_SHORT).show()
                         }
@@ -966,7 +1007,7 @@ fun initCameraControls(view: View, nodeId: String, hasControlParam: Boolean = tr
                 val manager = webRtcManager
                 if (manager == null || !manager.isActive()) {
                     Log.d("CameraControls", "onVideoStop: Manager is null or already stopped, just updating UI state")
-                    isPlaying = false
+                    // STATE CONTRACT: only onTerminallyStopped may flip isPlaying — omitted here.
                     isLoading = false
                     errorMessage = null
                     webRtcManager = null
@@ -1005,9 +1046,9 @@ fun initCameraControls(view: View, nodeId: String, hasControlParam: Boolean = tr
                     }
                     webRtcManager = null
                     EspApplication.clearActiveWebRtcManager()
-                    surfaceViewRenderer = null
-                    videoSessionKey++
-                    isPlaying = false
+                    // Renderer/key reset moved to the explicit user-Stop button onClick;
+                    // retries must reuse the live SurfaceView for instant frame rendering.
+                    // STATE CONTRACT: only onTerminallyStopped may flip isPlaying — omitted here.
                     isLoading = false
                     errorMessage = null
                 }
@@ -1038,6 +1079,16 @@ fun initCameraControls(view: View, nodeId: String, hasControlParam: Boolean = tr
                             webRtcManager?.let { manager ->
                                 Log.d("CameraControls", "Preserving WebRTC manager across config change")
                                 EspApplication.setViewportWebRtcManager(manager)
+                            }
+                        }
+                    } else if (event == Lifecycle.Event.ON_RESUME) {
+                        // ProcessLifecycleOwner.ON_STOP may have torn down the session
+                        // while we were backgrounded. Replay the last start params so
+                        // the video resumes without the user having to tap play again.
+                        webRtcManager?.let { manager ->
+                            if (!manager.isActive()) {
+                                Log.d("CameraControls", "ON_RESUME: viewport manager stopped, restarting")
+                                manager.restartIfStopped()
                             }
                         }
                     }
@@ -1191,6 +1242,18 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                 }
             }
 
+            // The ONLY signal that flips isPlaying back to false. Per the manager's STATE
+            // CONTRACT, intermediate stops inside retry/fallback chains don't fire this;
+            // only terminal stops (user action, exhausted retries, dead surface) do.
+            DisposableEffect(webRtcManager) {
+                webRtcManager?.onTerminallyStopped = {
+                    Log.d("CameraControls", "initViewportControls: onTerminallyStopped — flipping isPlaying=false")
+                    isPlaying = false
+                    isLoading = false
+                }
+                onDispose { webRtcManager?.onTerminallyStopped = null }
+            }
+
             val onVideoPlay: () -> Unit = {
                 // Check permissions first
                 val hasCameraPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -1207,8 +1270,10 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                     }
                     Toast.makeText(context, context.getString(R.string.camera_toast_permissions_required_alt), Toast.LENGTH_SHORT).show()
                 } else {
-                    // Check if region is available (credentials fetched)
-                    if (EspApplication.region.isNullOrEmpty()) {
+                    val espApp = context.applicationContext as EspApplication
+                    val isLocalDevice = espApp.localDeviceMap.containsKey(nodeId)
+
+                    if (!isLocalDevice && EspApplication.region.isNullOrEmpty()) {
                         Handler(Looper.getMainLooper()).post {
                             Toast.makeText(context, context.getString(R.string.camera_toast_fetching_credentials), Toast.LENGTH_SHORT).show()
                         }
@@ -1228,7 +1293,6 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                             }
                         }
                     } else {
-                        // Start WebRTC connection - SurfaceViewRenderer will be created and WebRTC initialized in LaunchedEffect
                         Log.d("CameraControls", "initViewportControls: Starting new video session")
                         isPlaying = true
                         isLoading = true
@@ -1242,7 +1306,7 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                 val manager = webRtcManager
                 if (manager == null || !manager.isActive()) {
                     Log.d("CameraControls", "initViewportControls: onVideoStop: Manager is null or already stopped, just updating UI state")
-                    isPlaying = false
+                    // STATE CONTRACT: only onTerminallyStopped may flip isPlaying — omitted here.
                     isLoading = false
                     errorMessage = null
                     webRtcManager = null
@@ -1292,9 +1356,9 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                         EspApplication.clearActiveWebRtcManager()
                         EspApplication.clearLandscapeSessionReferences()
 
-                        surfaceViewRenderer = null
-                        videoSessionKey++
-                        isPlaying = false
+                        // Renderer/key reset moved to the explicit user-Stop button onClick;
+                        // retries must reuse the live SurfaceView for instant frame rendering.
+                        // STATE CONTRACT: only onTerminallyStopped may flip isPlaying — omitted here.
                         isLoading = false
                         errorMessage = null
                     }
@@ -1358,6 +1422,16 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                         } else {
                             Log.d("CameraControls", "initViewportControls: Configuration change (rotation) - keeping WebRTC session alive")
                         }
+                    } else if (event == Lifecycle.Event.ON_RESUME) {
+                        // ProcessLifecycleOwner.ON_STOP may have torn down the session
+                        // while we were backgrounded. Replay the last start params so
+                        // the video resumes without the user having to tap play again.
+                        webRtcManager?.let { manager ->
+                            if (!manager.isActive()) {
+                                Log.d("CameraControls", "initViewportControls: ON_RESUME: viewport manager stopped, restarting")
+                                manager.restartIfStopped()
+                            }
+                        }
                     }
                 }
                 lifecycleOwner.lifecycle.addObserver(observer)
@@ -1385,120 +1459,174 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                 if (isPlaying && surfaceViewRenderer != null && webRtcManager == null) {
                     Log.d("CameraControls", "Starting new WebRTC session")
 
-                    // Wait for credentials to be available if not already (skip if using stored session)
-                    if (storedSessionInfo == null && EspApplication.region.isNullOrEmpty()) {
-                        if (!waitForCredentials()) {
-                            Log.e("CameraControls", "initViewportControls: Timeout waiting for credentials")
+                    // Clear any old video content from the renderer before starting new session
+                    surfaceViewRenderer?.clearImage()
+
+                    // Common connection state callback for both local and KVS modes
+                    val connectionCallback: (WebRtcViewportManager, Boolean) -> Unit = { manager, connected ->
+                        if (manager == webRtcManager) {
+                            Log.d("CameraControls", "Connection state changed: connected=$connected, isSwitchingVideo=$isSwitchingVideo")
                             isLoading = false
-                            isPlaying = false
-                            errorMessage = context.getString(R.string.camera_toast_credentials_failed)
-                            Handler(Looper.getMainLooper()).post {
-                                Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
+                            if (connected) {
+                                Log.d("CameraControls", "Connected successfully")
+                                isSwitchingVideo = false
+                                errorMessage = null
+                            } else {
+                                cleanupComplete?.let {
+                                    Log.d("CameraControls", "WebRTC cleanup complete - signaling deferred")
+                                    it.complete(Unit)
+                                    cleanupComplete = null
+                                }
+                                if (!manager.isActive()) {
+                                    // Per STATE CONTRACT, do NOT flip isPlaying here — only the
+                                    // manager's onTerminallyStopped callback may do that. This
+                                    // branch may run during an intermediate stop in a fallback chain.
+                                    // Renderer/key reset is reserved for the explicit user-Stop
+                                    // path; intermediate stops MUST preserve the live SurfaceView
+                                    // so the retry can render frames immediately on reconnect.
+                                    Log.d("CameraControls", "Manager stopped — intermediate state; isPlaying unchanged, SurfaceView preserved, waiting for onTerminallyStopped")
+                                    webRtcManager = null
+                                } else {
+                                    Log.d("CameraControls", "Connection lost - may recover, not auto-stopping")
+                                }
                             }
-                            return@LaunchedEffect
+                        } else {
+                            Log.d("CameraControls", "Ignoring callback from old manager: connected=$connected")
                         }
                     }
 
-                    // Clear any old video content from the renderer before starting new session
-                    surfaceViewRenderer?.clearImage()
-                    // Check if we have stored session info (from fullscreen transition)
-                    val channelInfo: WebRtcChannelInfo = if (storedSessionInfo != null) {
-                        Log.d("CameraControls", "Resuming with stored session info")
-                        storedSessionInfo!!
-                    } else {
-                        // Fetch channel endpoints only; ICE servers will be fetched
-                        // in parallel with WebSocket connect inside start()
-                        val region = EspApplication.region ?: "us-east-1"
-                        Log.d("CameraControls", "initViewportControls: Using region: $region for WebRTC connection")
-                        val result = WebRtcChannelInfoHelper.fetchChannelEndpoints(region, channelName.trim(), ChannelRole.VIEWER)
-                        result.getOrNull() ?: run {
-                            result.onFailure { e ->
+                    // KVS (cloud) signaling session starter — used as primary or fallback
+                    val startKvsSession: suspend () -> Unit = startKvsSession@{
+                        // Wait for credentials
+                        if (storedSessionInfo == null && EspApplication.region.isNullOrEmpty()) {
+                            if (!waitForCredentials()) {
+                                Log.e("CameraControls", "initViewportControls: Timeout waiting for credentials")
                                 isLoading = false
-                                isPlaying = false
-                                errorMessage = context.getString(R.string.camera_toast_webrtc_start_failed, e.message ?: "")
+                                // Do NOT flip isPlaying here — STATE CONTRACT says the manager's
+                                // onTerminallyStopped is the only valid signal.
+                                errorMessage = context.getString(R.string.camera_toast_credentials_failed)
                                 Handler(Looper.getMainLooper()).post {
                                     Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
                                 }
+                                return@startKvsSession
                             }
-                            return@LaunchedEffect
+                        }
+
+                        val channelInfo: WebRtcChannelInfo = if (storedSessionInfo != null) {
+                            Log.d("CameraControls", "Resuming with stored session info")
+                            storedSessionInfo!!
+                        } else {
+                            val region = EspApplication.region ?: "us-east-1"
+                            Log.d("CameraControls", "initViewportControls: Using region: $region for WebRTC connection")
+                            val result = WebRtcChannelInfoHelper.fetchChannelEndpoints(region, channelName.trim(), ChannelRole.VIEWER)
+                            result.getOrNull() ?: run {
+                                result.onFailure { e ->
+                                    isLoading = false
+                                    // Do NOT flip isPlaying here — STATE CONTRACT.
+                                    errorMessage = context.getString(R.string.camera_toast_webrtc_start_failed, e.message ?: "")
+                                    Handler(Looper.getMainLooper()).post {
+                                        Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                                return@startKvsSession
+                            }
+                        }
+
+                        val manager = WebRtcViewportManager(context, lifecycleOwner)
+                        manager.setCallbacks(
+                            onConnectionStateChanged = { connected -> connectionCallback(manager, connected) },
+                            onError = { error ->
+                                isLoading = false
+                                errorMessage = error
+                                Handler(Looper.getMainLooper()).post {
+                                    Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        )
+
+                        webRtcManager = manager
+                        EspApplication.setActiveWebRtcManager(manager)
+
+                        try {
+                            manager.start(
+                                channelArn = channelInfo.channelArn,
+                                streamArn = channelInfo.streamArn,
+                                wssEndpoint = channelInfo.wssEndpoint,
+                                webrtcEndpoint = channelInfo.webrtcEndpoint,
+                                region = channelInfo.region,
+                                iceServers = channelInfo.iceServers,
+                                dataEndpoint = channelInfo.dataEndpoint,
+                                surfaceViewRenderer = surfaceViewRenderer!!,
+                                isMaster = false,
+                                clientId = storedClientId
+                            )
+                            storedSessionInfo = null
+                            storedClientId = null
+                        } catch (e: Exception) {
+                            Log.e("CameraControls", "initViewportControls: Failed to start WebRTC: ${e.message}", e)
+                            isLoading = false
+                            // Do NOT flip isPlaying here — STATE CONTRACT.
+                            errorMessage = context.getString(R.string.camera_toast_start_failed, e.message ?: "")
+                            webRtcManager = null
+                            Handler(Looper.getMainLooper()).post {
+                                Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
+                            }
                         }
                     }
 
-                    val manager = WebRtcViewportManager(context, lifecycleOwner)
-                    manager.setCallbacks(
-                        onConnectionStateChanged = { connected ->
-                            // Only process callbacks from the current active manager
-                            if (manager == webRtcManager) {
-                                Log.d("CameraControls", "Connection state changed: connected=$connected, isSwitchingVideo=$isSwitchingVideo")
-                                isLoading = false
-                                if (connected) {
-                                    Log.d("CameraControls", "Connected successfully")
-                                    isSwitchingVideo = false
+                    // Auto-switch: try local signaling if device is on local network
+                    val espApp = context.applicationContext as EspApplication
+                    val localDevice = espApp.localDeviceMap[nodeId]
+
+                    if (localDevice != null && storedSessionInfo == null) {
+                        Log.d("CameraControls", "Device $nodeId available locally, using local signaling")
+                        // Guard the local→KVS fallback so it fires exactly once: LocalSignalingClient
+                        // can call onError repeatedly (poll timeout, then ICE failure, …) and the
+                        // start() catch can race it; without this each path would stop() + launch a
+                        // second KVS manager, leaking managers that fight over the shared surface.
+                        val localFallbackTriggered = java.util.concurrent.atomic.AtomicBoolean(false)
+                        val manager = WebRtcViewportManager(context, lifecycleOwner)
+                        manager.setCallbacks(
+                            onConnectionStateChanged = { connected -> connectionCallback(manager, connected) },
+                            onError = { error ->
+                                if (localFallbackTriggered.compareAndSet(false, true)) {
+                                    Log.w("CameraControls", "Local signaling failed: $error, falling back to KVS")
+                                    Log.i("CameraControls", "stop-reason=local-signaling-fallback (full tear-down; a softer signaling-only reset is not yet supported)")
+                                    // Mark the OLD manager so its stop() suppresses onTerminallyStopped
+                                    // — a KVS replacement is about to come up.
+                                    manager.markRestartInFlight()
+                                    manager.stop()
+                                    webRtcManager = null
+                                    isLoading = true
                                     errorMessage = null
+                                    coroutineScope.launch { startKvsSession() }
                                 } else {
-                                    // Signal cleanup is complete if switching
-                                    cleanupComplete?.let {
-                                        Log.d("CameraControls", "WebRTC cleanup complete - signaling deferred")
-                                        it.complete(Unit)
-                                        cleanupComplete = null
-                                    }
-
-                                    // Check if manager was explicitly stopped (not just transient disconnect)
-                                    if (!manager.isActive()) {
-                                        // Manager was stopped (e.g., from landscape mode)
-                                        Log.d("CameraControls", "Manager was stopped - updating playing state")
-                                        isPlaying = false
-                                        webRtcManager = null
-                                        surfaceViewRenderer = null
-                                        videoSessionKey++
-                                    } else {
-                                        // Do NOT auto-stop on disconnect - ICE DISCONNECTED is often
-                                        // transient on mobile networks and may recover.
-                                        // Just log it; user can manually stop if needed.
-                                        Log.d("CameraControls", "Connection lost - may recover, not auto-stopping")
-                                    }
+                                    Log.d("CameraControls", "Local→KVS fallback already in progress; ignoring duplicate onError: $error")
                                 }
-                            } else {
-                                Log.d("CameraControls", "Ignoring callback from old manager: connected=$connected")
                             }
-                        },
-                        onError = { error ->
-                            isLoading = false
-                            errorMessage = error
-                            Handler(Looper.getMainLooper()).post {
-                                Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                            }
-                        }
-                    )
-
-                    // Set as active manager before starting to ensure callbacks are processed
-                    webRtcManager = manager
-                    EspApplication.setActiveWebRtcManager(manager)
-
-                    try {
-                        manager.start(
-                            channelArn = channelInfo.channelArn,
-                            streamArn = channelInfo.streamArn,
-                            wssEndpoint = channelInfo.wssEndpoint,
-                            webrtcEndpoint = channelInfo.webrtcEndpoint,
-                            region = channelInfo.region,
-                            iceServers = channelInfo.iceServers,
-                            dataEndpoint = channelInfo.dataEndpoint,
-                            surfaceViewRenderer = surfaceViewRenderer!!,
-                            isMaster = false,
-                            clientId = storedClientId  // Reuse client ID if available
                         )
-                        storedSessionInfo = null
-                        storedClientId = null
-                    } catch (e: Exception) {
-                        Log.e("CameraControls", "initViewportControls: Failed to start WebRTC: ${e.message}", e)
-                        isLoading = false
-                        isPlaying = false
-                        errorMessage = context.getString(R.string.camera_toast_start_failed, e.message ?: "")
-                        webRtcManager = null
-                        Handler(Looper.getMainLooper()).post {
-                            Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
+
+                        webRtcManager = manager
+                        EspApplication.setActiveWebRtcManager(manager)
+
+                        try {
+                            manager.startLocal(
+                                localDevice = localDevice,
+                                surfaceViewRenderer = surfaceViewRenderer!!,
+                                clientId = storedClientId
+                            )
+                            storedClientId = null
+                        } catch (e: Exception) {
+                            if (localFallbackTriggered.compareAndSet(false, true)) {
+                                Log.e("CameraControls", "Local signaling start failed: ${e.message}; falling back to KVS (full tear-down — a softer signaling-only reset is not yet supported)")
+                                manager.markRestartInFlight()
+                                manager.stop()
+                                webRtcManager = null
+                                startKvsSession()
+                            }
                         }
+                    } else {
+                        startKvsSession()
                     }
                 }
             }
@@ -1628,7 +1756,8 @@ fun initViewportControls(composeView: ComposeView, channelName: String, nodeId: 
                             MaterialTheme.colorScheme.surfaceContainer,
                             RoundedCornerShape(8.dp)
                         ),
-                    videoSessionKey = videoSessionKey
+                    videoSessionKey = videoSessionKey,
+                    onSessionKeyIncrement = { videoSessionKey++ }
                 )
             }
         }
@@ -1850,92 +1979,137 @@ fun CameraControlsWithViewport(
         if (isPlaying && surfaceViewRenderer != null && webRtcManager == null) {
             Log.d("CameraControls", "CameraControlsWithViewport starting new WebRTC session")
 
-            // Wait for credentials to be available if not already
-            if (EspApplication.region.isNullOrEmpty()) {
-                if (!waitForCredentials()) {
-                    Log.e("CameraControls", "Timeout waiting for credentials")
-                    Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(context, context.getString(R.string.camera_toast_credentials_failed), Toast.LENGTH_LONG).show()
-                    }
-                    // Stop the video playback attempt
-                    onVideoStop()
-                    return@LaunchedEffect
-                }
-            }
-
             // Clear any old video content from the renderer before starting new session
             surfaceViewRenderer?.clearImage()
-            val region = EspApplication.region ?: "us-east-1"
-            Log.d("CameraControls", "Using region: $region for WebRTC connection")
-            val result = WebRtcChannelInfoHelper.fetchChannelEndpoints(region, channelName.trim(), ChannelRole.VIEWER)
-            val channelInfo = result.getOrNull() ?: run {
-                result.onFailure { e ->
-                    Toast.makeText(context, context.getString(R.string.camera_toast_webrtc_start_failed, e.message ?: ""), Toast.LENGTH_LONG).show()
+
+            // Common connection state callback
+            val connectionCallback: (WebRtcViewportManager, Boolean) -> Unit = { manager, connected ->
+                if (manager == webRtcManager || webRtcManager == null) {
+                    Log.d("CameraControls", "CameraControlsWithViewport connection state: connected=$connected, isSwitchingVideo=$isSwitchingVideo")
+                    if (connected) {
+                        Log.d("CameraControls", "CameraControlsWithViewport connected successfully")
+                        onSwitchingVideoChange(false)
+                    } else {
+                        cleanupComplete?.let {
+                            Log.d("CameraControls", "CameraControlsWithViewport cleanup complete - signaling deferred")
+                            it.complete(Unit)
+                            onCleanupCompleteChange(null)
+                        }
+                        if (!manager.isActive()) {
+                            // Intermediate stop in a retry/fallback chain — keep the live
+                            // SurfaceView so the next connect renders frames immediately.
+                            // Renderer/key reset is reserved for the explicit user-Stop path.
+                            Log.d("CameraControls", "CameraControlsWithViewport manager was stopped - intermediate state; SurfaceView preserved, waiting for onTerminallyStopped")
+                            onVideoStop()
+                        } else {
+                            Log.d("CameraControls", "CameraControlsWithViewport connection lost - may recover, not auto-stopping")
+                        }
+                    }
+                } else {
+                    Log.d("CameraControls", "CameraControlsWithViewport ignoring callback from old manager: connected=$connected")
                 }
-                return@LaunchedEffect
             }
 
-            val manager = WebRtcViewportManager(context, lifecycleOwner)
-            manager.setCallbacks(
-                onConnectionStateChanged = { connected ->
-                    // Only process callbacks from the current active manager
-                    if (manager == webRtcManager || webRtcManager == null) {
-                        Log.d("CameraControls", "CameraControlsWithViewport connection state: connected=$connected, isSwitchingVideo=$isSwitchingVideo")
-                        if (connected) {
-                            // Successfully connected, clear switching flag
-                            Log.d("CameraControls", "CameraControlsWithViewport connected successfully")
-                            onSwitchingVideoChange(false)
-                        } else {
-                            // Signal cleanup is complete if switching
-                            cleanupComplete?.let {
-                                Log.d("CameraControls", "CameraControlsWithViewport cleanup complete - signaling deferred")
-                                it.complete(Unit)
-                                onCleanupCompleteChange(null)
-                            }
-
-                            // Check if manager was explicitly stopped (e.g. from landscape mode)
-                            if (!manager.isActive()) {
-                                Log.d("CameraControls", "CameraControlsWithViewport manager was stopped - updating UI state")
-                                onVideoStop()
-                                onSurfaceViewRendererChange(null)
-                                onSessionKeyIncrement()
-                            } else {
-                                // Do NOT auto-stop on disconnect - ICE DISCONNECTED is often
-                                // transient on mobile networks and may recover.
-                                Log.d("CameraControls", "CameraControlsWithViewport connection lost - may recover, not auto-stopping")
-                            }
+            // KVS (cloud) signaling session starter — used as primary or fallback
+            val startKvsSession: suspend () -> Unit = startKvsSession@{
+                if (EspApplication.region.isNullOrEmpty()) {
+                    if (!waitForCredentials()) {
+                        Log.e("CameraControls", "Timeout waiting for credentials")
+                        Handler(Looper.getMainLooper()).post {
+                            Toast.makeText(context, context.getString(R.string.camera_toast_credentials_failed), Toast.LENGTH_LONG).show()
                         }
-                    } else {
-                        Log.d("CameraControls", "CameraControlsWithViewport ignoring callback from old manager: connected=$connected")
+                        onVideoStop()
+                        return@startKvsSession
                     }
-                },
-                onError = { error ->
-                    Toast.makeText(context, error, Toast.LENGTH_LONG).show()
                 }
-            )
 
-            try {
-                manager.start(
-                    channelArn = channelInfo.channelArn,
-                    streamArn = channelInfo.streamArn,
-                    wssEndpoint = channelInfo.wssEndpoint,
-                    webrtcEndpoint = channelInfo.webrtcEndpoint,
-                    region = channelInfo.region,
-                    iceServers = channelInfo.iceServers,
-                    dataEndpoint = channelInfo.dataEndpoint,
-                    surfaceViewRenderer = surfaceViewRenderer!!,
-                    isMaster = false,
-                    clientId = storedClientId
-                )
-                onWebRtcManagerChange(manager)
-                EspApplication.setViewportWebRtcManager(manager)
-            } catch (e: Exception) {
-                Log.e("CameraControls", "CameraControlsWithViewport: Failed to start WebRTC: ${e.message}", e)
-                onWebRtcManagerChange(null)
-                onVideoStop()
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(context, context.getString(R.string.camera_toast_start_failed, e.message ?: ""), Toast.LENGTH_LONG).show()
+                val region = EspApplication.region ?: "us-east-1"
+                Log.d("CameraControls", "Using region: $region for WebRTC connection")
+                val result = WebRtcChannelInfoHelper.fetchChannelEndpoints(region, channelName.trim(), ChannelRole.VIEWER)
+                val channelInfo = result.getOrNull() ?: run {
+                    result.onFailure { e ->
+                        Toast.makeText(context, context.getString(R.string.camera_toast_webrtc_start_failed, e.message ?: ""), Toast.LENGTH_LONG).show()
+                    }
+                    onVideoStop()
+                    return@startKvsSession
                 }
+
+                val manager = WebRtcViewportManager(context, lifecycleOwner)
+                manager.setCallbacks(
+                    onConnectionStateChanged = { connected -> connectionCallback(manager, connected) },
+                    onError = { error ->
+                        Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                    }
+                )
+
+                try {
+                    manager.start(
+                        channelArn = channelInfo.channelArn,
+                        streamArn = channelInfo.streamArn,
+                        wssEndpoint = channelInfo.wssEndpoint,
+                        webrtcEndpoint = channelInfo.webrtcEndpoint,
+                        region = channelInfo.region,
+                        iceServers = channelInfo.iceServers,
+                        dataEndpoint = channelInfo.dataEndpoint,
+                        surfaceViewRenderer = surfaceViewRenderer!!,
+                        isMaster = false,
+                        clientId = storedClientId
+                    )
+                    onWebRtcManagerChange(manager)
+                    EspApplication.setViewportWebRtcManager(manager)
+                } catch (e: Exception) {
+                    Log.e("CameraControls", "CameraControlsWithViewport: Failed to start WebRTC: ${e.message}", e)
+                    onWebRtcManagerChange(null)
+                    onVideoStop()
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(context, context.getString(R.string.camera_toast_start_failed, e.message ?: ""), Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+
+            // Auto-switch: try local signaling if device is on local network
+            val espApp = context.applicationContext as EspApplication
+            val localDevice = espApp.localDeviceMap[nodeId]
+
+            if (localDevice != null && storedSessionInfo == null) {
+                Log.d("CameraControls", "CameraControlsWithViewport: Device $nodeId available locally, using local signaling")
+                // One-shot guard: see initViewportControls — onError can fire repeatedly and
+                // race the start() catch, so without this each path starts a second KVS manager.
+                val localFallbackTriggered = java.util.concurrent.atomic.AtomicBoolean(false)
+                val manager = WebRtcViewportManager(context, lifecycleOwner)
+                manager.setCallbacks(
+                    onConnectionStateChanged = { connected -> connectionCallback(manager, connected) },
+                    onError = { error ->
+                        if (localFallbackTriggered.compareAndSet(false, true)) {
+                            Log.w("CameraControls", "CameraControlsWithViewport: Local signaling failed: $error, falling back to KVS")
+                            manager.markRestartInFlight()
+                            manager.stop()
+                            onWebRtcManagerChange(null)
+                            coroutineScope.launch { startKvsSession() }
+                        } else {
+                            Log.d("CameraControls", "CameraControlsWithViewport: Local→KVS fallback already in progress; ignoring duplicate onError: $error")
+                        }
+                    }
+                )
+
+                try {
+                    manager.startLocal(
+                        localDevice = localDevice,
+                        surfaceViewRenderer = surfaceViewRenderer!!,
+                        clientId = storedClientId
+                    )
+                    onWebRtcManagerChange(manager)
+                    EspApplication.setViewportWebRtcManager(manager)
+                } catch (e: Exception) {
+                    if (localFallbackTriggered.compareAndSet(false, true)) {
+                        Log.e("CameraControls", "CameraControlsWithViewport: Local start failed: ${e.message}, falling back to KVS")
+                        manager.markRestartInFlight()
+                        manager.stop()
+                        startKvsSession()
+                    }
+                }
+            } else {
+                startKvsSession()
             }
         }
     }
@@ -2030,7 +2204,8 @@ fun CameraControlsWithViewport(
                             MaterialTheme.colorScheme.surfaceContainer,
                             RoundedCornerShape(8.dp)
                         ),
-                    videoSessionKey = videoSessionKey
+                    videoSessionKey = videoSessionKey,
+                    onSessionKeyIncrement = onSessionKeyIncrement
                 )
 
             if (useSimpleUI) {

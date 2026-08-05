@@ -29,6 +29,9 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatDelegate;
+import androidx.lifecycle.DefaultLifecycleObserver;
+import androidx.lifecycle.LifecycleOwner;
+import androidx.lifecycle.ProcessLifecycleOwner;
 
 import com.espressif.AppConstants.Companion.UpdateEventType;
 import com.espressif.cloudapi.ApiManager;
@@ -58,6 +61,7 @@ import com.espressif.ui.models.Scene;
 import com.espressif.ui.models.Schedule;
 import com.espressif.ui.models.Service;
 import com.espressif.ui.models.UpdateEvent;
+import com.espressif.ui.webrtc.WebRtcViewportManager;
 import com.espressif.utils.NodeUtils;
 import com.espressif.utils.ParamUtils;
 import com.google.android.gms.tasks.OnCompleteListener;
@@ -136,21 +140,21 @@ public class EspApplication extends Application {
     public static String channelName = "", region = "";
 
     // WebRTC viewport manager for session reuse across viewport/landscape
-    public static com.espressif.ui.webrtc.WebRtcViewportManager viewportWebRtcManager = null;
+    public static WebRtcViewportManager viewportWebRtcManager = null;
 
     // Active WebRTC session manager — used by EspDeviceActivity.onStop() to stop the session
     // when the activity goes to background (e.g. back gesture on task root from notification).
-    private static com.espressif.ui.webrtc.WebRtcViewportManager activeWebRtcManager = null;
+    private static WebRtcViewportManager activeWebRtcManager = null;
 
     // Flag to suppress WebRTC cleanup during portrait→landscape transition.
     // Set before starting WebRtcActivity, cleared in EspDeviceActivity.onResume().
     public static boolean isLandscapeTransitionActive = false;
 
-    public static void setViewportWebRtcManager(com.espressif.ui.webrtc.WebRtcViewportManager manager) {
+    public static void setViewportWebRtcManager(WebRtcViewportManager manager) {
         viewportWebRtcManager = manager;
     }
 
-    public static com.espressif.ui.webrtc.WebRtcViewportManager getViewportWebRtcManager() {
+    public static WebRtcViewportManager getViewportWebRtcManager() {
         return viewportWebRtcManager;
     }
 
@@ -158,11 +162,11 @@ public class EspApplication extends Application {
         viewportWebRtcManager = null;
     }
 
-    public static void setActiveWebRtcManager(com.espressif.ui.webrtc.WebRtcViewportManager manager) {
+    public static void setActiveWebRtcManager(WebRtcViewportManager manager) {
         activeWebRtcManager = manager;
     }
 
-    public static com.espressif.ui.webrtc.WebRtcViewportManager getActiveWebRtcManager() {
+    public static WebRtcViewportManager getActiveWebRtcManager() {
         return activeWebRtcManager;
     }
 
@@ -297,7 +301,45 @@ public class EspApplication extends Application {
 
         // Initialize WebRTC helpers
         com.espressif.ui.webrtc.WebRtcChannelInfoHelper.init(this);
-        com.espressif.ui.webrtc.WebRtcViewportManager.preInitializePeerConnectionFactory(this);
+        WebRtcViewportManager.preInitializePeerConnectionFactory(this);
+
+        // Stop the shared viewport WebRTC session when the whole app goes to background.
+        // Without this, a session can keep running with no UI attached after the user
+        // backgrounds the app. ON_START is intentionally a no-op — the next activity
+        // that needs WebRTC re-initializes through its normal entry points.
+        ProcessLifecycleOwner.get().getLifecycle().addObserver(new DefaultLifecycleObserver() {
+            @Override
+            public void onStop(@NonNull LifecycleOwner owner) {
+                WebRtcViewportManager manager = viewportWebRtcManager;
+                if (manager != null) {
+                    Log.d(TAG, "App backgrounded - stopping viewport WebRTC session (with restart-in-flight)");
+                    try {
+                        // Suppress onTerminallyStopped — onStart() will replay via restartIfStopped().
+                        manager.markRestartInFlight();
+                        manager.stop();
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error stopping viewport WebRTC session on background", e);
+                    }
+                }
+            }
+
+            @Override
+            public void onStart(@NonNull LifecycleOwner owner) {
+                // Covers OEM freeze/unfreeze cases (e.g. Motorola moto_freezer) where the
+                // Activity never re-emits ON_RESUME, so the Composable-level restart hook
+                // does not fire. Safe no-op if the manager is still active or has no cached
+                // params.
+                WebRtcViewportManager manager = viewportWebRtcManager;
+                if (manager != null) {
+                    Log.d(TAG, "App foregrounded - attempting viewport WebRTC restart");
+                    try {
+                        manager.restartIfStopped();
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error restarting viewport WebRTC session on foreground", e);
+                    }
+                }
+            }
+        });
     }
 
     public AppState getAppState() {

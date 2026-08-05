@@ -17,21 +17,28 @@
 
         <ImageView
             android:id="@+id/iv_app_logo"
-            android:layout_width="410dp"
-            android:layout_height="417dp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:adjustViewBounds="true"
             android:src="@drawable/ic_esp_splash"
+            app:layout_constraintWidth_percent="0.6"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintHorizontal_bias="0.5"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toTopOf="@+id/layout_app_info"
+            app:layout_constraintVertical_chainStyle="packed" />
 
         <LinearLayout
+            android:id="@+id/layout_app_info"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
             android:orientation="vertical"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/iv_app_logo">
+            app:layout_constraintTop_toBottomOf="@id/iv_app_logo"
+            app:layout_constraintBottom_toTopOf="@id/layout_links">
 
             <TextView
                 android:id="@+id/tv_app_version_label"

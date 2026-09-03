@@ -267,6 +267,10 @@ class AppConstants {
         const val URL_CHANGE_PASSWORD = "/password"
         const val URL_LOGOUT = "/logout"
 
+        // Native federated sign-in. The provider name is appended to this path.
+        const val URL_FEDERATED_AUTH = "/auth/federated"
+        const val FEDERATED_PROVIDER_GOOGLE = "google"
+
         const val URL_LOGIN_2 = "/login2"
         const val URL_USER_2 = "/user2"
         const val URL_FORGOT_PASSWORD_2 = "/forgotpassword2"

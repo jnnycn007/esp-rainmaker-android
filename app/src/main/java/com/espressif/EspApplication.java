@@ -61,6 +61,7 @@ import com.espressif.ui.models.Scene;
 import com.espressif.ui.models.Schedule;
 import com.espressif.ui.models.Service;
 import com.espressif.ui.models.UpdateEvent;
+import com.espressif.ui.user_module.GoogleSignInManager;
 import com.espressif.ui.webrtc.WebRtcViewportManager;
 import com.espressif.utils.NodeUtils;
 import com.espressif.utils.ParamUtils;
@@ -1276,6 +1277,12 @@ public class EspApplication extends Application {
     public void clearUserSession() {
 
         clearData();
+
+        // Forget the Google account that was used to sign in, so the account chooser is shown
+        // again on the next Google login instead of reusing the previous account.
+        GoogleSignInManager.signOut(this);
+        ApiManager.isOAuthLogin = false;
+
         SharedPreferences.Editor editor = appPreferences.edit();
 
         // Save keys to preserve (base URL, and theme preference)

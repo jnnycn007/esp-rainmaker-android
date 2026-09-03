@@ -29,6 +29,7 @@ import android.widget.Toast
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.constraintlayout.widget.ConstraintSet
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
 
 import com.espressif.cloudapi.ApiManager
 import com.espressif.cloudapi.ApiResponseListener
@@ -38,6 +39,7 @@ import com.espressif.rainmaker.databinding.FragmentLoginBinding
 import com.espressif.ui.Utils
 import com.espressif.ui.activities.MainActivity
 import com.espressif.ui.user_module.ForgotPasswordActivity
+import com.espressif.ui.user_module.GoogleSignInManager
 import com.tencent.mm.opensdk.modelmsg.SendAuth
 import com.tencent.mm.opensdk.openapi.IWXAPI
 import com.tencent.mm.opensdk.openapi.WXAPIFactory
@@ -169,7 +171,7 @@ class LoginFragment : Fragment(R.layout.fragment_login) {
 
         } else {
             binding.btnLoginWithWeChat.layoutBtn.visibility = View.GONE
-            
+
             // Update constraint to position Apple button directly below Google button when WeChat is hidden
             val appleButton = binding.btnLoginWithApple.root
             val googleButton = binding.btnLoginWithGoogle.root
@@ -200,11 +202,7 @@ class LoginFragment : Fragment(R.layout.fragment_login) {
         }
 
         binding.btnLoginWithGoogle.layoutBtn.setOnClickListener {
-//            showGoogleLoginLoading();
-            val uriStr = BuildConfig.GOOGLE_URL
-            val uri = Uri.parse(uriStr)
-            val openURL = Intent(Intent.ACTION_VIEW, uri)
-            startActivity(openURL)
+            loginUsingGoogle()
         }
 
         binding.btnLoginWithApple.layoutBtnApple.setOnClickListener {
@@ -288,6 +286,79 @@ class LoginFragment : Fragment(R.layout.fragment_login) {
         (activity as MainActivity?)!!.signInUser(email, password)
     }
 
+    /**
+     * Shows the Google account picker and logs in with the account the user selects.
+     */
+    private fun loginUsingGoogle() {
+
+        showGoogleLoginLoading()
+
+        GoogleSignInManager(requireActivity()).signIn(
+            viewLifecycleOwner.lifecycleScope,
+            object : GoogleSignInManager.GoogleSignInListener {
+
+                override fun onSignInSuccess(idToken: String) {
+                    Log.e(TAG, "ID Token : $idToken")
+                    getTokenForGoogleUser(idToken)
+                }
+
+                override fun onSignInCancelled() {
+                    hideGoogleLoginLoading()
+                }
+
+                override fun onNoGoogleAccount() {
+                    hideGoogleLoginLoading()
+                    Toast.makeText(activity, R.string.error_no_google_account, Toast.LENGTH_LONG)
+                        .show()
+                }
+
+                override fun onSignInUnavailable() {
+                    hideGoogleLoginLoading()
+                    loginUsingHostedGoogleFlow()
+                }
+
+                override fun onSignInFailure(exception: Exception) {
+                    hideGoogleLoginLoading()
+                    Toast.makeText(activity, R.string.error_google_sign_in, Toast.LENGTH_SHORT)
+                        .show()
+                }
+            })
+    }
+
+    /**
+     * Google login through the RainMaker hosted authorize URL, opened in a browser. Used when the
+     * account picker cannot be shown, either because no Google web client id is configured for
+     * this build or because Credential Manager is not usable on the device.
+     */
+    private fun loginUsingHostedGoogleFlow() {
+        Log.d(TAG, "Google account picker is not available, using the hosted login flow")
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.GOOGLE_URL)))
+    }
+
+    private fun getTokenForGoogleUser(idToken: String) {
+
+        val apiManager = ApiManager.getInstance(requireActivity().applicationContext)
+
+        apiManager.loginWithGoogleIdToken(idToken, object : ApiResponseListener {
+
+            override fun onSuccess(data: Bundle?) {
+                Log.d(TAG, "Received success in Google login")
+                hideGoogleLoginLoading()
+                (activity as MainActivity?)?.launchHomeScreen()
+            }
+
+            override fun onResponseFailure(exception: Exception) {
+                hideGoogleLoginLoading()
+                Toast.makeText(activity, R.string.error_login, Toast.LENGTH_SHORT).show()
+            }
+
+            override fun onNetworkFailure(exception: Exception) {
+                hideGoogleLoginLoading()
+                Toast.makeText(activity, R.string.error_login, Toast.LENGTH_SHORT).show()
+            }
+        })
+    }
+
     fun loginUsingWeChat() {
         Log.d(TAG, "WeChat Login function called")
         if (!api.isWXAppInstalled()) {
@@ -320,15 +391,20 @@ class LoginFragment : Fragment(R.layout.fragment_login) {
     }
 
     fun showGoogleLoginLoading() {
-        binding.btnLoginWithGoogle.layoutBtn.isEnabled = false
-        binding.btnLoginWithGoogle.layoutBtn.alpha = 0.5f
-        binding.btnLoginWithGoogle.progressIndicator.visibility = View.VISIBLE
+        // Login response may arrive after the view is gone, so bind defensively.
+        _binding?.btnLoginWithGoogle?.let {
+            it.layoutBtn.isEnabled = false
+            it.layoutBtn.alpha = 0.5f
+            it.progressIndicator.visibility = View.VISIBLE
+        }
     }
 
     fun hideGoogleLoginLoading() {
-        binding.btnLoginWithGoogle.layoutBtn.isEnabled = true
-        binding.btnLoginWithGoogle.layoutBtn.alpha = 1f
-        binding.btnLoginWithGoogle.progressIndicator.visibility = View.GONE
+        _binding?.btnLoginWithGoogle?.let {
+            it.layoutBtn.isEnabled = true
+            it.layoutBtn.alpha = 1f
+            it.progressIndicator.visibility = View.GONE
+        }
     }
 
     fun showLoading() {

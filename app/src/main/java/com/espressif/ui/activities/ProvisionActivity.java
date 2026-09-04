@@ -31,6 +31,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.widget.ContentLoadingProgressBar;
 
 import com.espressif.AppConstants;
+import com.espressif.ui.Utils;
 import com.espressif.EspApplication;
 import com.espressif.cloudapi.ApiManager;
 import com.espressif.cloudapi.ApiResponseListener;
@@ -119,6 +120,11 @@ public class ProvisionActivity extends AppCompatActivity {
     private EspLocalDevice localDevice;
 
     private boolean isBleLocalCtrlFlow = false;
+
+    /* Time service/param names read from the device config, for the BLE-only TZ step. */
+    private String bleTimeServiceName = null;
+    private String bleTzParamName = null;
+    private String bleTimestampParamName = null;
     private String bleLocalCtrlDeviceName = null;
     private String bleLocalCtrlPop = null;
     private Handler wifiConnectHandler = new Handler();
@@ -1286,6 +1292,15 @@ public class ProvisionActivity extends AppCompatActivity {
                         @Override
                         public void run() {
                             EspNode espNode = espApp.nodeMap.get(receivedNodeId);
+                            Log.d(TAG, "TZ: node=" + receivedNodeId
+                                    + ", inNodeMap=" + (espNode != null)
+                                    + ", isOnline=" + (espNode != null && espNode.isOnline())
+                                    + ", isBleLocalCtrlFlow=" + isBleLocalCtrlFlow);
+                            if (espNode == null || !espNode.isOnline()) {
+                                // A BLE-only node is never cloud connected, so this path is
+                                // skipped and no time zone is sent anywhere in that flow.
+                                Log.w(TAG, "TZ: skipping time zone send - node not cloud connected");
+                            }
                             if (espNode != null && espNode.isOnline()) {
 
                                 // Send time zone to device.
@@ -1310,6 +1325,8 @@ public class ProvisionActivity extends AppCompatActivity {
                                                 tsName = p.getName();
                                             }
                                         }
+                                        Log.d(TAG, "TZ: time service '" + s.getName()
+                                                + "' tzParam=" + tzName + ", tsParam=" + tsName);
                                         if (!TextUtils.isEmpty(tzName)) {
                                             isTimeZoneServiceAvailable = true;
                                             paramName = tzName;
@@ -1335,10 +1352,14 @@ public class ProvisionActivity extends AppCompatActivity {
                                         Log.d(TAG, "Timestamp (s) : " + timestampSec);
                                     }
                                     body.add(AppConstants.KEY_TIME, jsonParam);
+                                    // apiManager, not networkApiManager - this always goes to
+                                    // the cloud and never over BLE or WLAN.
+                                    Log.d(TAG, "TZ: sending via cloud apiManager, body=" + body);
                                     apiManager.updateParamValue(espNode.getNodeId(), body, new ApiResponseListener() {
 
                                         @Override
                                         public void onSuccess(Bundle data) {
+                                            Log.d(TAG, "TZ: send success for node " + receivedNodeId);
                                             handler.removeCallbacks(nodeStatusReqFailed);
                                             tick5.setImageResource(R.drawable.ic_checkbox_on);
                                             tick5.setVisibility(View.VISIBLE);
@@ -1510,12 +1531,125 @@ public class ProvisionActivity extends AppCompatActivity {
      */
     private void startBleLocalCtrlFlow() {
         Log.d(TAG, "Starting BLE local control flow for node: " + receivedNodeId);
+        Log.d(TAG, "TZ: phone time zone is " + TimeZone.getDefault().getID());
         tick1.setImageResource(R.drawable.ic_checkbox_on);
         tick1.setVisibility(View.VISIBLE);
         progress1.setVisibility(View.GONE);
 
         /* Step 1: Get config with timestamp and report to proxy */
         getConfigAndReportToProxy();
+    }
+
+    /**
+     * Reads the time service and time zone param names out of the device config, so the
+     * time zone is written with the names this firmware actually uses rather than
+     * hardcoded ones.
+     */
+    private void extractTimeParamNames(JSONObject configData) {
+
+        bleTimeServiceName = null;
+        bleTzParamName = null;
+        bleTimestampParamName = null;
+
+        if (configData == null) {
+            return;
+        }
+        JSONArray services = configData.optJSONArray("services");
+        if (services == null) {
+            return;
+        }
+
+        for (int i = 0; i < services.length(); i++) {
+            JSONObject service = services.optJSONObject(i);
+            if (service == null
+                    || !AppConstants.SERVICE_TYPE_TIME.equals(service.optString("type"))) {
+                continue;
+            }
+            JSONArray params = service.optJSONArray("params");
+            if (params == null) {
+                continue;
+            }
+            String tzName = null;
+            String tsName = null;
+            for (int j = 0; j < params.length(); j++) {
+                JSONObject param = params.optJSONObject(j);
+                if (param == null) {
+                    continue;
+                }
+                String type = param.optString("type");
+                if (AppConstants.PARAM_TYPE_TZ.equals(type)) {
+                    tzName = param.optString("name");
+                } else if (AppConstants.PARAM_TYPE_TIMESTAMP.equals(type)) {
+                    tsName = param.optString("name");
+                }
+            }
+            if (!TextUtils.isEmpty(tzName)) {
+                bleTimeServiceName = service.optString("name");
+                bleTzParamName = tzName;
+                bleTimestampParamName = tsName;
+                break;
+            }
+        }
+        Log.d(TAG, "TZ: config exposes service=" + bleTimeServiceName
+                + ", tzParam=" + bleTzParamName
+                + ", timestampParam=" + bleTimestampParamName);
+    }
+
+    /**
+     * Writes the phone's time zone to the device over the provisioning BLE session.
+     * <p>
+     * A BLE-only device never reaches the cloud time zone path, which is gated on the node
+     * being cloud connected and sends through the cloud API. Without this its TZ stays
+     * empty, and schedules fire from the node's own clock.
+     * <p>
+     * Only TZ is written; the firmware derives TZ-POSIX from it, the same as the cloud
+     * path does. Failure is not fatal - provisioning continues either way.
+     */
+    private void sendTimeZoneOverBle(Runnable next) {
+
+        ESPDevice espDevice = provisionManager.getEspDevice();
+        if (espDevice == null || TextUtils.isEmpty(bleTimeServiceName)
+                || TextUtils.isEmpty(bleTzParamName)) {
+            Log.w(TAG, "TZ: skipping BLE time zone send, device=" + (espDevice != null)
+                    + ", service=" + bleTimeServiceName + ", param=" + bleTzParamName);
+            next.run();
+            return;
+        }
+
+        String timeZoneId = TimeZone.getDefault().getID();
+        JsonObject jsonParam = new JsonObject();
+        jsonParam.addProperty(bleTzParamName, timeZoneId);
+
+        // A BLE-only device has no Wi-Fi and no cloud, so no SNTP either - this is likely
+        // its only source of wall-clock time, without which schedules cannot fire.
+        if (!TextUtils.isEmpty(bleTimestampParamName)) {
+            long timestampSec = System.currentTimeMillis() / 1000L;
+            jsonParam.addProperty(bleTimestampParamName, timestampSec);
+            Log.d(TAG, "TZ: including timestamp (s) " + timestampSec);
+        } else {
+            Log.d(TAG, "TZ: device exposes no timestamp param, sending time zone only");
+        }
+
+        JsonObject body = new JsonObject();
+        body.add(bleTimeServiceName, jsonParam);
+
+        Log.d(TAG, "TZ: sending over BLE, body=" + body);
+
+        espDevice.sendDataToCustomEndPoint(AppConstants.HANDLER_SET_PARAMS,
+                body.toString().getBytes(StandardCharsets.UTF_8), new ResponseListener() {
+
+                    @Override
+                    public void onSuccess(byte[] returnData) {
+                        Log.d(TAG, "TZ: sent over BLE successfully (" + timeZoneId + ")");
+                        runOnUiThread(next);
+                    }
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        Log.e(TAG, "TZ: failed to send over BLE: " + e.getMessage());
+                        runOnUiThread(next);
+                    }
+                });
     }
 
     /**
@@ -1562,19 +1696,23 @@ public class ProvisionActivity extends AppCompatActivity {
 
                     Log.d(TAG, "Reporting config to proxy - payload length: " + nodePayloadStr.length() + ", signature length: " + signature.length());
 
+                    /* Time service/param names, for the time zone step below */
+                    extractTimeParamNames(nodePayloadObj.optJSONObject("data"));
+
                     /* Report directly to proxy (device already signed it) */
                     reportToProxy(nodePayloadStr, signature, true, new ProxyReportCallback() {
                         @Override
                         public void onSuccess() {
-                            /* Continue to get params - show success tick */
-                            runOnUiThread(() -> getParamsAndReportToProxy(true));
+                            /* Set the time zone before reading params, so the snapshot
+                             * reported to proxy/initparams already carries it */
+                            runOnUiThread(() -> sendTimeZoneOverBle(() -> getParamsAndReportToProxy(true)));
                         }
 
                         @Override
                         public void onFailure(Exception e) {
                             Log.e(TAG, "Failed to report config to proxy: " + e.getMessage());
                             /* Continue but show failure */
-                            runOnUiThread(() -> getParamsAndReportToProxy(false));
+                            runOnUiThread(() -> sendTimeZoneOverBle(() -> getParamsAndReportToProxy(false)));
                         }
                     });
                 } catch (Exception e) {
@@ -1695,10 +1833,19 @@ public class ProvisionActivity extends AppCompatActivity {
         progress4.setVisibility(View.VISIBLE);
 
         try {
+            // Recorded now, while the BLE session can still read prov.cap. Later screens
+            // may have no session to ask, and this is the durable record of whether the
+            // firmware offers Wi-Fi/Thread provisioning at all.
+            ArrayList<String> deviceCaps = provisionManager.getEspDevice() != null
+                    ? provisionManager.getEspDevice().getDeviceCapabilities()
+                    : null;
+            boolean wifiCapable = Utils.hasNetworkProvisioningCapability(deviceCaps);
+
             JsonObject metadata = new JsonObject();
             JsonObject bleLocalCtrl = new JsonObject();
             bleLocalCtrl.addProperty("name", bleLocalCtrlDeviceName != null ? bleLocalCtrlDeviceName : "");
             bleLocalCtrl.addProperty("pop", bleLocalCtrlPop != null ? bleLocalCtrlPop : "");
+            bleLocalCtrl.addProperty(AppConstants.KEY_BLE_LOCAL_CTRL_WIFI_CAPABLE, wifiCapable);
             metadata.add("ble_local_ctrl", bleLocalCtrl);
 
             JsonObject body = new JsonObject();

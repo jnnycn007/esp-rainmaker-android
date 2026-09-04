@@ -114,7 +114,13 @@ public class EspNode implements Parcelable {
     @Ignore
     private NodeMetadata nodeMetadata;
 
-    @Ignore
+    /**
+     * Persisted, unlike the other @Ignore fields: BLE local control lives entirely in
+     * metadata.ble_local_ctrl, and a BLE-only node has to stay reachable with no cloud
+     * to fetch it from. Losing this on an offline start left collectBleDevices() empty
+     * and no BLE scan ever started.
+     */
+    @ColumnInfo(name = "metadata_json")
     private String nodeMetadataJson;
 
     @Ignore
@@ -392,8 +398,48 @@ public class EspNode implements Parcelable {
         return nodeMetadataJson;
     }
 
+    /**
+     * Stores node metadata, keeping a PoP we already know when the incoming metadata has
+     * none.
+     * <p>
+     * The cloud can return ble_local_ctrl with pop null or empty, and overwriting a good
+     * PoP leaves the node unable to open a BLE session - which is the only way to reach a
+     * BLE-only device. iOS guards against the same behaviour by keeping a separate copy of
+     * the PoP; keeping the old value here holds one source of truth instead.
+     */
     public void setNodeMetadataJson(String nodeMetadataJson) {
-        this.nodeMetadataJson = nodeMetadataJson;
+        this.nodeMetadataJson = preserveBleLocalCtrlPop(nodeMetadataJson, this.nodeMetadataJson);
+    }
+
+    private static String preserveBleLocalCtrlPop(String incomingJson, String existingJson) {
+
+        if (TextUtils.isEmpty(incomingJson) || TextUtils.isEmpty(existingJson)) {
+            return incomingJson;
+        }
+
+        try {
+            org.json.JSONObject incoming = new org.json.JSONObject(incomingJson);
+            org.json.JSONObject incomingBle = incoming.optJSONObject("ble_local_ctrl");
+            if (incomingBle == null || !TextUtils.isEmpty(incomingBle.optString("pop", ""))) {
+                return incomingJson;
+            }
+
+            org.json.JSONObject existingBle =
+                    new org.json.JSONObject(existingJson).optJSONObject("ble_local_ctrl");
+            String existingPop = (existingBle != null) ? existingBle.optString("pop", "") : "";
+            if (TextUtils.isEmpty(existingPop)) {
+                return incomingJson;
+            }
+
+            incomingBle.put("pop", existingPop);
+            incoming.put("ble_local_ctrl", incomingBle);
+            Log.d("EspNode", "Kept previously known ble_local_ctrl pop");
+            return incoming.toString();
+
+        } catch (org.json.JSONException e) {
+            Log.e("EspNode", "Failed to merge ble_local_ctrl pop", e);
+            return incomingJson;
+        }
     }
 
     /**

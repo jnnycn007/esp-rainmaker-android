@@ -53,6 +53,27 @@ import java.util.TimeZone;
 
 public class Utils {
 
+    /**
+     * True when the device advertises a Wi-Fi or Thread provisioning endpoint.
+     * <p>
+     * A BLE-only device omits these capabilities because its firmware has no network
+     * provisioning to offer. There is then nothing for the user to skip, so the caller
+     * should go straight to BLE-only setup instead of asking. A hybrid device advertises
+     * both and is still worth asking about.
+     *
+     * @param deviceCaps the device's prov capabilities, from ESPDevice.getDeviceCapabilities()
+     */
+    public static boolean hasNetworkProvisioningCapability(ArrayList<String> deviceCaps) {
+
+        if (deviceCaps == null) {
+            return false;
+        }
+        return deviceCaps.contains(AppConstants.CAPABILITY_WIFI_SCAN)
+                || deviceCaps.contains(AppConstants.CAPABILITY_WIFI_PROV)
+                || deviceCaps.contains(AppConstants.CAPABILITY_THREAD_SCAN)
+                || deviceCaps.contains(AppConstants.CAPABILITY_THREAD_PROV);
+    }
+
     public static final String TAG = Utils.class.getSimpleName();
 
     public static void createESPDevice(Context appContext, ESPConstants.TransportType transportType, int securityType) {

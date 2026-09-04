@@ -186,6 +186,9 @@ class AppConstants {
         const val CAPABILITY_CHALLENGE_RESP = "ch_resp"
         const val CAPABILITY_LOCAL_CTRL = "local_ctrl"
 
+        // Persisted in node metadata under ble_local_ctrl at BLE-only onboarding.
+        const val KEY_BLE_LOCAL_CTRL_WIFI_CAPABLE = "wifi_capable"
+
         // Device End point names
         const val HANDLER_RM_USER_MAPPING = "cloud_user_assoc"
         const val HANDLER_RM_CLAIM = "rmaker_claim"

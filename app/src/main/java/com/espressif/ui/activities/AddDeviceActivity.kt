@@ -865,6 +865,14 @@ class AddDeviceActivity : AppCompatActivity() {
         if (!hasLocalCtrl || !hasChResp) return false
         if (espDevice!!.transportType != ESPConstants.TransportType.TRANSPORT_BLE) return false
 
+        if (!Utils.hasNetworkProvisioningCapability(deviceCaps)) {
+            // BLE-only device: its firmware offers no Wi-Fi or Thread provisioning, so
+            // there is nothing to skip and nothing to ask about.
+            Log.d(TAG, "BLE-only device, starting BLE local control setup directly")
+            startBleLocalCtrlFlow()
+            return true
+        }
+
         Log.d(TAG, "BLE local control capabilities found - showing skip Wi-Fi dialog")
         showSkipWifiProvisioningDialog()
         return true
@@ -883,6 +891,44 @@ class AddDeviceActivity : AppCompatActivity() {
         }
     }
 
+    /** Starts BLE-only setup: no Wi-Fi credentials are sent to the device. */
+    private fun startBleLocalCtrlFlow() {
+
+        /* Get device name from ESPDevice */
+        var deviceName: String? = null
+        if (espDevice != null && espDevice!!.bluetoothDevice != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                    deviceName = espDevice!!.bluetoothDevice.name
+                }
+            } else {
+                deviceName = espDevice!!.bluetoothDevice.name
+            }
+        }
+
+        /* Get PoP from ESPDevice (set during QR code scan or manual entry) */
+        val espDevicePop = espDevice?.proofOfPossession
+        val intentPop = intent.getStringExtra(AppConstants.KEY_PROOF_OF_POSSESSION)
+        Log.d(TAG, "BLE Local Ctrl - ESPDevice PoP: $espDevicePop, Intent PoP: $intentPop")
+        var pop = espDevicePop
+        if (pop.isNullOrEmpty()) {
+            /* Fallback to intent extra */
+            pop = intentPop
+        }
+        Log.d(TAG, "Starting BLE local control flow - deviceName: $deviceName, pop: $pop")
+
+        /* Go to ProvisionActivity with BLE local control flag */
+        val provisionIntent = Intent(applicationContext, ProvisionActivity::class.java)
+        provisionIntent.putExtras(intent)
+        if (!deviceName.isNullOrEmpty()) {
+            provisionIntent.putExtra(AppConstants.KEY_DEVICE_NAME, deviceName)
+        }
+        provisionIntent.putExtra(AppConstants.KEY_PROOF_OF_POSSESSION, pop)
+        provisionIntent.putExtra(AppConstants.KEY_BLE_LOCAL_CTRL, true)
+        startActivity(provisionIntent)
+        finish()
+    }
+
     private fun showSkipWifiProvisioningDialog() {
         val builder = AlertDialog.Builder(this)
         builder.setCancelable(false)
@@ -890,39 +936,7 @@ class AddDeviceActivity : AppCompatActivity() {
         builder.setMessage(R.string.skip_wifi_provisioning_msg)
 
         builder.setPositiveButton(R.string.btn_yes) { dialog, which ->
-            /* Get device name from ESPDevice */
-            var deviceName: String? = null
-            if (espDevice != null && espDevice!!.bluetoothDevice != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-                        deviceName = espDevice!!.bluetoothDevice.name
-                    }
-                } else {
-                    deviceName = espDevice!!.bluetoothDevice.name
-                }
-            }
-
-            /* Get PoP from ESPDevice (set during QR code scan or manual entry) */
-            val espDevicePop = espDevice?.proofOfPossession
-            val intentPop = intent.getStringExtra(AppConstants.KEY_PROOF_OF_POSSESSION)
-            Log.d(TAG, "BLE Local Ctrl - ESPDevice PoP: $espDevicePop, Intent PoP: $intentPop")
-            var pop = espDevicePop
-            if (pop.isNullOrEmpty()) {
-                /* Fallback to intent extra */
-                pop = intentPop
-            }
-            Log.d(TAG, "Starting BLE local control flow - deviceName: $deviceName, pop: $pop")
-
-            /* Go to ProvisionActivity with BLE local control flag */
-            val provisionIntent = Intent(applicationContext, ProvisionActivity::class.java)
-            provisionIntent.putExtras(intent)
-            if (!deviceName.isNullOrEmpty()) {
-                provisionIntent.putExtra(AppConstants.KEY_DEVICE_NAME, deviceName)
-            }
-            provisionIntent.putExtra(AppConstants.KEY_PROOF_OF_POSSESSION, pop)
-            provisionIntent.putExtra(AppConstants.KEY_BLE_LOCAL_CTRL, true)
-            startActivity(provisionIntent)
-            finish()
+            startBleLocalCtrlFlow()
         }
 
         builder.setNegativeButton(R.string.btn_no) { dialog, which ->

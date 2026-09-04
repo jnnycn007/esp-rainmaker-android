@@ -71,6 +71,8 @@ import com.espressif.ui.models.Param
 import com.espressif.ui.models.Service
 import com.espressif.ui.models.UpdateEvent
 import com.espressif.utils.NodeUtils.Companion.getService
+import com.espressif.utils.ParamTransport
+import com.espressif.utils.ParamTransportResolver
 import com.espressif.webrtc.IoTCredentialsProvider
 import com.espressif.webrtc.WebRtcConstants
 import com.google.android.gms.threadnetwork.ThreadBorderAgent
@@ -118,6 +120,9 @@ class EspDeviceActivity : AppCompatActivity() {
     private var nodeType: String? = null
     private var matterNodeId: String? = null
     private var nodeStatus = 0
+
+    /** BLE-connected state the options menu was last built for. */
+    private var menuBleConnected = false
     private var timeStampOfStatus: Long = 0
     private var isControllerClusterAvailable = false
     private var isTbrClusterAvailable: Boolean = false
@@ -367,27 +372,38 @@ class EspDeviceActivity : AppCompatActivity() {
         }
 
         if (bleLocalCtrlInfo != null && nodeId != null) {
-            val bleManager = BleLocalControlManager.getInstance(this)
-            if (bleManager.isConnected(nodeId!!)) {
-                nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
-                espApp.nodeMap[nodeId]?.nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
-                paramAdapter?.setNodeStatus(AppConstants.NODE_STATUS_BLE_LOCAL)
-                queryCurrentParamsViaBle()
-                startUpdateValueTask()
-                updateUi()
-            } else if (bleManager.isDiscovered(nodeId!!)) {
-                bleManager.connectDevice(nodeId!!) { success ->
-                    runOnUiThread {
-                        if (success) {
-                            nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
-                            espApp.nodeMap[nodeId]?.nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
-                            paramAdapter?.setNodeStatus(AppConstants.NODE_STATUS_BLE_LOCAL)
-                            queryCurrentParamsViaBle()
-                            startUpdateValueTask()
-                            updateUi()
+            // BLE is the last transport, so only take over the screen when WLAN and the
+            // cloud are both unavailable. Otherwise leave the node on its own transport -
+            // forcing BLE here would read and write over BLE for a node that is online.
+            if (ParamTransportResolver.preferredTransport(espApp, nodeId) == ParamTransport.BLE) {
+                val bleManager = BleLocalControlManager.getInstance(this)
+                if (bleManager.isConnected(nodeId!!)) {
+                    nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
+                    espApp.nodeMap[nodeId]?.nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
+                    paramAdapter?.setNodeStatus(AppConstants.NODE_STATUS_BLE_LOCAL)
+                    queryCurrentParamsViaBle()
+                    startUpdateValueTask()
+                    updateUi()
+                } else if (bleManager.isDiscovered(nodeId!!)) {
+                    bleManager.connectDevice(nodeId!!) { success ->
+                        runOnUiThread {
+                            if (success) {
+                                nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
+                                espApp.nodeMap[nodeId]?.nodeStatus = AppConstants.NODE_STATUS_BLE_LOCAL
+                                paramAdapter?.setNodeStatus(AppConstants.NODE_STATUS_BLE_LOCAL)
+                                queryCurrentParamsViaBle()
+                                startUpdateValueTask()
+                                updateUi()
+                            }
                         }
                     }
                 }
+            } else {
+                // Keep the value poll running for this node. getNodeDetails() above stops
+                // it, and only this block restarts it - NetworkApiManager routes each
+                // request to whichever transport currently has priority.
+                startUpdateValueTask()
+                updateUi()
             }
         }
 
@@ -455,8 +471,8 @@ class EspDeviceActivity : AppCompatActivity() {
             )
 
         val node = espApp.nodeMap[nodeId]
-        val bleManager = BleLocalControlManager.getInstance(this)
-        if (node != null && nodeId != null && bleManager.isConnected(nodeId!!)) {
+        menuBleConnected = isBleSessionOpen()
+        if (node != null && menuBleConnected) {
             if (getService(node, AppConstants.SERVICE_TYPE_SCHEDULE) != null) {
                 menu.add(Menu.NONE, 2, Menu.NONE, R.string.btn_add_schedule)
                     .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
@@ -467,6 +483,23 @@ class EspDeviceActivity : AppCompatActivity() {
             }
         }
         return true
+    }
+
+    private fun isBleSessionOpen(): Boolean {
+        val id = nodeId ?: return false
+        return BleLocalControlManager.getInstance(this).isConnected(id)
+    }
+
+    /**
+     * The Add Schedule / Add Scene items depend on an open BLE session, but the session is
+     * established asynchronously after the screen is already up - and onCreateOptionsMenu
+     * runs only once. Rebuild the menu when that state actually changes, so the items
+     * appear once the session lands and disappear if it drops.
+     */
+    private fun refreshOptionsMenuForBleState() {
+        if (isBleSessionOpen() != menuBleConnected) {
+            invalidateOptionsMenu()
+        }
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
@@ -1346,6 +1379,8 @@ class EspDeviceActivity : AppCompatActivity() {
         var deviceFound = false
         var updatedDevice: Device? = null
         lastUpdateRequestTime = System.currentTimeMillis()
+
+        refreshOptionsMenuForBleState()
 
         val currentNode = espApp.nodeMap[nodeId]
         if (currentNode != null) {

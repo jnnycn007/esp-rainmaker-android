@@ -28,7 +28,7 @@ import com.espressif.ui.models.EspNode;
 import com.espressif.ui.models.Group;
 import com.espressif.ui.models.NotificationEvent;
 
-@Database(entities = {EspNode.class, Group.class, NotificationEvent.class}, version = 3, exportSchema = false)
+@Database(entities = {EspNode.class, Group.class, NotificationEvent.class}, version = 4, exportSchema = false)
 @TypeConverters({StringArrayListConverters.class})
 public abstract class EspDatabase extends RoomDatabase {
 
@@ -51,6 +51,7 @@ public abstract class EspDatabase extends RoomDatabase {
                 AppConstants.ESP_DATABASE_NAME)
                 .addMigrations(MIGRATION_2_3)
                 .addMigrations(MIGRATION_1_3)
+                .addMigrations(MIGRATION_3_4)
                 .allowMainThreadQueries().build();
     }
 
@@ -63,6 +64,18 @@ public abstract class EspDatabase extends RoomDatabase {
         public void migrate(SupportSQLiteDatabase database) {
             database.execSQL("CREATE TABLE IF NOT EXISTS `" + AppConstants.GROUP_TABLE + "` (`groupId` TEXT NOT NULL, `group_name` TEXT NOT NULL, `node_list` TEXT, PRIMARY KEY(`groupId`))");
             database.execSQL("CREATE TABLE IF NOT EXISTS `" + AppConstants.NOTIFICATION_TABLE + "` (`notificationId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `event_version` TEXT, `event_type` TEXT, `description` TEXT, `id` TEXT, `event_data` TEXT, `timestamp` INTEGER NOT NULL, `notification_msg` TEXT)");
+        }
+    };
+
+    /**
+     * Adds metadata_json so metadata.ble_local_ctrl survives a restart. Without it a
+     * BLE-only node cannot be found again unless the cloud is reachable, which is the
+     * one case where BLE is the only way to reach it.
+     */
+    static final Migration MIGRATION_3_4 = new Migration(3, 4) {
+        @Override
+        public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("ALTER TABLE `" + AppConstants.NODE_TABLE + "` ADD COLUMN `metadata_json` TEXT");
         }
     };
 

@@ -31,6 +31,12 @@ public class ParamDiffCallback extends DiffUtil.Callback {
         this.newParamList = newParamList;
     }
 
+    private static boolean isBoolean(Param param) {
+        String dataType = param.getDataType();
+        return dataType != null
+                && (dataType.equalsIgnoreCase("bool") || dataType.equalsIgnoreCase("boolean"));
+    }
+
     @Override
     public int getOldListSize() {
         return oldParamList.size();
@@ -51,6 +57,17 @@ public class ParamDiffCallback extends DiffUtil.Callback {
     public boolean areContentsTheSame(int oldItemPosition, int newItemPosition) {
         final Param oldParam = oldParamList.get(oldItemPosition);
         final Param newParam = newParamList.get(newItemPosition);
+
+        // A boolean param's bound View can be out of step with this baseline: interaction
+        // handlers mutate the adapter's list in place (ParamAdapter sets switchStatus on
+        // write success) without a rebind, so a later refresh can find "no change" while
+        // the switch on screen still shows the old state, and never correct itself.
+        // Rebinding these unconditionally is cheap - the listener is detached before
+        // setChecked - and leaves slider diffing untouched so drags are not disturbed.
+        if (isBoolean(oldParam) || isBoolean(newParam)) {
+            return false;
+        }
+
         int a = oldParam.compareTo(newParam);
 
         if (oldParam.getDependencies() != null || newParam.getDependencies() != null) {

@@ -1107,6 +1107,10 @@ public class ParamAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> 
 
             paramViewHolder.toggleSwitch.setVisibility(View.VISIBLE);
             paramViewHolder.toggleSwitch.setOnCheckedChangeListener(null);
+            Log.d(TAG, "displayToggle: param=" + param.getName()
+                    + ", switchStatus=" + param.getSwitchStatus()
+                    + ", wasChecked=" + paramViewHolder.toggleSwitch.isChecked()
+                    + ", isNodeOnline=" + ((EspDeviceActivity) context).isNodeOnline());
             paramViewHolder.toggleSwitch.setChecked(param.getSwitchStatus());
 
             if (((EspDeviceActivity) context).isNodeOnline()) {

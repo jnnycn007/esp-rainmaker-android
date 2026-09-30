@@ -335,6 +335,13 @@ public class ProofOfPossessionActivity extends AppCompatActivity {
                     || (deviceCaps != null && deviceCaps.contains(AppConstants.CAPABILITY_CHALLENGE_RESP));
 
             if (hasLocalCtrl && hasChResp) {
+                if (!Utils.hasNetworkProvisioningCapability(deviceCaps)) {
+                    // BLE-only device: its firmware offers no Wi-Fi or Thread provisioning,
+                    // so there is nothing to skip and nothing to ask about.
+                    Log.d(TAG, "BLE-only device, starting BLE local control setup directly");
+                    startBleLocalCtrlFlow();
+                    return true;
+                }
                 showSkipWifiProvisioningDialog();
                 return true;
             }
@@ -342,6 +349,23 @@ public class ProofOfPossessionActivity extends AppCompatActivity {
             Log.e(TAG, "Error checking BLE local ctrl caps: " + e.getMessage());
         }
         return false;
+    }
+
+    /** Starts BLE-only setup: no Wi-Fi credentials are sent to the device. */
+    private void startBleLocalCtrlFlow() {
+
+        String pop = provisionManager.getEspDevice().getProofOfPossession();
+        String devName = provisionManager.getEspDevice().getDeviceName();
+
+        Intent provisionIntent = new Intent(getApplicationContext(), ProvisionActivity.class);
+        provisionIntent.putExtras(getIntent());
+        if (!TextUtils.isEmpty(devName)) {
+            provisionIntent.putExtra(AppConstants.KEY_DEVICE_NAME, devName);
+        }
+        provisionIntent.putExtra(AppConstants.KEY_PROOF_OF_POSSESSION, pop);
+        provisionIntent.putExtra(AppConstants.KEY_BLE_LOCAL_CTRL, true);
+        startActivity(provisionIntent);
+        finish();
     }
 
     private void showSkipWifiProvisioningDialog() {
@@ -353,18 +377,7 @@ public class ProofOfPossessionActivity extends AppCompatActivity {
         builder.setPositiveButton(R.string.btn_yes, new DialogInterface.OnClickListener() {
             @Override
             public void onClick(DialogInterface dialog, int which) {
-                String pop = provisionManager.getEspDevice().getProofOfPossession();
-                String devName = provisionManager.getEspDevice().getDeviceName();
-
-                Intent provisionIntent = new Intent(getApplicationContext(), ProvisionActivity.class);
-                provisionIntent.putExtras(getIntent());
-                if (!TextUtils.isEmpty(devName)) {
-                    provisionIntent.putExtra(AppConstants.KEY_DEVICE_NAME, devName);
-                }
-                provisionIntent.putExtra(AppConstants.KEY_PROOF_OF_POSSESSION, pop);
-                provisionIntent.putExtra(AppConstants.KEY_BLE_LOCAL_CTRL, true);
-                startActivity(provisionIntent);
-                finish();
+                startBleLocalCtrlFlow();
             }
         });
 

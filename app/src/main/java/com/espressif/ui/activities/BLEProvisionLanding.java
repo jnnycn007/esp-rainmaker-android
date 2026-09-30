@@ -548,6 +548,14 @@ public class BLEProvisionLanding extends AppCompatActivity {
             return false;
         }
 
+        if (!Utils.hasNetworkProvisioningCapability(deviceCaps)) {
+            // BLE-only device: its firmware offers no Wi-Fi or Thread provisioning, so
+            // there is nothing to skip and nothing to ask about.
+            Log.d(TAG, "BLE-only device, starting BLE local control setup directly");
+            startBleLocalCtrlFlow();
+            return true;
+        }
+
         Log.d(TAG, "BLE local control capabilities found - showing skip Wi-Fi dialog");
         try {
             showSkipWifiProvisioningDialog();
@@ -766,6 +774,61 @@ public class BLEProvisionLanding extends AppCompatActivity {
         startActivity(claimingIntent);
     }
 
+    /** Starts BLE-only setup: no Wi-Fi credentials are sent to the device. */
+    private void startBleLocalCtrlFlow() {
+
+        /* Get device name and PoP for BLE local control */
+        String deviceName = null;
+
+        /* Try to get device name from stored position first */
+        if (position >= 0 && position < deviceList.size()) {
+            deviceName = deviceList.get(position).getName();
+        }
+
+        /* If not available, try to get from connected device or intent */
+        if (TextUtils.isEmpty(deviceName)) {
+            ESPDevice espDevice = provisionManager.getEspDevice();
+            if (espDevice != null && espDevice.getBluetoothDevice() != null) {
+                /* Try to get from Bluetooth device name */
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    if (ActivityCompat.checkSelfPermission(BLEProvisionLanding.this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                        deviceName = espDevice.getBluetoothDevice().getName();
+                    }
+                } else {
+                    deviceName = espDevice.getBluetoothDevice().getName();
+                }
+            }
+
+            /* Fallback to intent extra */
+            if (TextUtils.isEmpty(deviceName)) {
+                deviceName = getIntent().getStringExtra(AppConstants.KEY_DEVICE_NAME);
+            }
+        }
+
+        /* Get PoP from ESPDevice first (set during connection), then fallback to intent */
+        String pop = null;
+        ESPDevice espDevice = provisionManager.getEspDevice();
+        if (espDevice != null) {
+            pop = espDevice.getProofOfPossession();
+        }
+        if (TextUtils.isEmpty(pop)) {
+            pop = getIntent().getStringExtra(AppConstants.KEY_PROOF_OF_POSSESSION);
+        }
+
+        Log.d(TAG, "Starting BLE local control flow - deviceName: " + deviceName + ", pop: " + (TextUtils.isEmpty(pop) ? "empty" : "set"));
+
+        /* Go to ProvisionActivity with BLE local control flag */
+        Intent provisionIntent = new Intent(getApplicationContext(), ProvisionActivity.class);
+        provisionIntent.putExtras(getIntent());
+        if (!TextUtils.isEmpty(deviceName)) {
+            provisionIntent.putExtra(AppConstants.KEY_DEVICE_NAME, deviceName);
+        }
+        provisionIntent.putExtra(AppConstants.KEY_PROOF_OF_POSSESSION, pop);
+        provisionIntent.putExtra(AppConstants.KEY_BLE_LOCAL_CTRL, true);
+        startActivity(provisionIntent);
+        finish();
+    }
+
     private void showSkipWifiProvisioningDialog() {
         Log.d(TAG, "showSkipWifiProvisioningDialog() called on thread: " + Thread.currentThread().getName());
         
@@ -790,56 +853,7 @@ public class BLEProvisionLanding extends AppCompatActivity {
         builder.setPositiveButton(R.string.btn_yes, new DialogInterface.OnClickListener() {
             @Override
             public void onClick(DialogInterface dialog, int which) {
-                /* Get device name and PoP for BLE local control */
-                String deviceName = null;
-                
-                /* Try to get device name from stored position first */
-                if (position >= 0 && position < deviceList.size()) {
-                    deviceName = deviceList.get(position).getName();
-                }
-                
-                /* If not available, try to get from connected device or intent */
-                if (TextUtils.isEmpty(deviceName)) {
-                    ESPDevice espDevice = provisionManager.getEspDevice();
-                    if (espDevice != null && espDevice.getBluetoothDevice() != null) {
-                        /* Try to get from Bluetooth device name */
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            if (ActivityCompat.checkSelfPermission(BLEProvisionLanding.this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-                                deviceName = espDevice.getBluetoothDevice().getName();
-                            }
-                        } else {
-                            deviceName = espDevice.getBluetoothDevice().getName();
-                        }
-                    }
-                    
-                    /* Fallback to intent extra */
-                    if (TextUtils.isEmpty(deviceName)) {
-                        deviceName = getIntent().getStringExtra(AppConstants.KEY_DEVICE_NAME);
-                    }
-                }
-                
-                /* Get PoP from ESPDevice first (set during connection), then fallback to intent */
-                String pop = null;
-                ESPDevice espDevice = provisionManager.getEspDevice();
-                if (espDevice != null) {
-                    pop = espDevice.getProofOfPossession();
-                }
-                if (TextUtils.isEmpty(pop)) {
-                    pop = getIntent().getStringExtra(AppConstants.KEY_PROOF_OF_POSSESSION);
-                }
-
-                Log.d(TAG, "Starting BLE local control flow - deviceName: " + deviceName + ", pop: " + (TextUtils.isEmpty(pop) ? "empty" : "set"));
-
-                /* Go to ProvisionActivity with BLE local control flag */
-                Intent provisionIntent = new Intent(getApplicationContext(), ProvisionActivity.class);
-                provisionIntent.putExtras(getIntent());
-                if (!TextUtils.isEmpty(deviceName)) {
-                    provisionIntent.putExtra(AppConstants.KEY_DEVICE_NAME, deviceName);
-                }
-                provisionIntent.putExtra(AppConstants.KEY_PROOF_OF_POSSESSION, pop);
-                provisionIntent.putExtra(AppConstants.KEY_BLE_LOCAL_CTRL, true);
-                startActivity(provisionIntent);
-                finish();
+                startBleLocalCtrlFlow();
             }
         });
 

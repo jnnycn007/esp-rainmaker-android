@@ -40,6 +40,7 @@ import com.espressif.db.EspDatabase;
 import com.espressif.local_control.EspLocalDevice;
 import com.espressif.local_control.LocalControlApiManager;
 import com.espressif.local_control.mDNSManager;
+import com.espressif.utils.EspNetworkMonitor;
 import com.espressif.matter.ChipClient;
 import com.espressif.matter.ChipClientHelper;
 import com.espressif.matter.ClustersHelper;
@@ -268,6 +269,9 @@ public class EspApplication extends Application {
     public void onCreate() {
         super.onCreate();
         Log.d(TAG, "ESP Application is created");
+
+        // Start before any param transport decision can consult it.
+        EspNetworkMonitor.init(this);
 
         initializeTheme();
 

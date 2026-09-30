@@ -190,6 +190,13 @@ public class EspMainActivity extends AppCompatActivity implements BleLocalContro
         }
 
         BleLocalControlManager.getInstance(this).addListener(this);
+        refreshBleReachability();
+    }
+
+    private void refreshBleReachability() {
+        BleLocalControlManager bleManager = BleLocalControlManager.getInstance(this);
+        bleManager.reapplyBleStatusToConnectedNodes();
+        bleManager.scanForDevices();
     }
 
     @Override
@@ -294,11 +301,12 @@ public class EspMainActivity extends AppCompatActivity implements BleLocalContro
                         Toast.makeText(EspMainActivity.this, errMsg, Toast.LENGTH_SHORT).show();
                     }
                 }
-                if (espApp.getAppState() == EspApplication.AppState.GET_DATA_SUCCESS) {
-                    BleLocalControlManager bleManager = BleLocalControlManager.getInstance(this);
-                    bleManager.reapplyBleStatusToConnectedNodes();
-                    bleManager.scanForDevices(this);
-                }
+                // Not gated on app state: BLE reachability does not depend on the cloud,
+                // and while offline no successful refresh ever arrives. Scanning
+                // unconditionally is also cheap - the transport priority in
+                // ParamTransportResolver still keeps WLAN and cloud ahead of BLE, so a node
+                // reachable either of those ways is tracked but never labelled as BLE.
+                refreshBleReachability();
                 updateUi();
                 break;
 
